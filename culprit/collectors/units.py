@@ -1,40 +1,42 @@
-"""Unit actions: the Outage Doctor's verbs.
+"""Service actions: the Outage Doctor's verbs, on Windows services.
 
-The Lag Doctor's findings come with End task, renice and Throttle; until now
-the Outage Doctor's items came with a command to copy. This closes that gap
-with the four things a person types after reading one of its cards --
-`systemctl restart`, `start`, `reload-or-restart`, `reset-failed` -- run on
-the agent with the same guards the process actions have: never the init
-scope, never journald / logind / udevd / dbus (the machine goes with them),
-never the unit running this agent, and nothing that is not a unit name.
+The Lag Doctor's findings come with End task, priority and Throttle; the
+Outage Doctor's items come with the things a person types after reading one
+of its cards -- on Linux `systemctl restart / start / reload-or-restart /
+reset-failed`, here the SCM's start and restart -- run on the agent with the
+same guards the process actions have: never the services Windows cannot run
+without (RPC, the event log, Plug and Play, WMI, the session manager, LSA),
+never the task running this agent, and nothing that is not a service name.
 `stop` is deliberately not offered: nothing the Outage Doctor reports is
 fixed by stopping something.
 
-The unit's state is read before and after from `systemctl show`, so the
-result says what happened ("failed -> active, main pid 4410") rather than
-that a command returned zero. Whether the fix *held* is the host's verdict
-watch, which follows the node's next outage samples, not this module.
+Verb mapping: `restart` and `start` are what they say; `reload-or-restart`
+becomes a restart (Windows services have a pause/continue control but no
+reload); `reset-failed` has nothing to reset -- the SCM keeps no failed
+state past the exit code -- and is refused with that reason. The service's
+state is read before and after from QueryServiceStatusEx, so the result says
+what happened ("stopped -> running, pid 4410") rather than that a call
+returned. Whether the fix *held* is the host's verdict watch, which follows
+the node's next outage samples, not this module.
 
-A system unit needs root or a polkit rule for
-org.freedesktop.systemd1.manage-units; the agent reports exactly that when
-it lacks it, the same way Throttle does.
+Controlling a service needs the SERVICE_START right, which a standard user
+does not have for most services: the agent reports exactly that when it
+lacks it, the same way Throttle does.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
-import subprocess
 import time
 from typing import Any
 
-from .. import linux
+from .. import windows
 
 log = logging.getLogger("culprit.units")
 
 VERBS = ("restart", "start", "reload-or-restart", "reset-failed")
-MANAGERS = ("system", "user")
+MANAGERS = ("system",)
 # What the Outage Doctor offers per item kind (the agent decides, so the
 # dashboard renders data rather than choosing verbs on the host's behalf).
 OFFERED = {
@@ -43,44 +45,17 @@ OFFERED = {
     "unit_stopped": ("start",),
     "not_listening": ("reload-or-restart",),
 }
+# Services the machine (or every session on it) goes down with.
 PROTECTED = frozenset({
-    "init.scope", "dbus.service", "dbus-broker.service",
-    "systemd-journald.service", "systemd-logind.service",
-    "systemd-udevd.service", "user.slice", "system.slice", "-.slice",
+    "rpcss", "dcomlaunch", "rpceptmapper", "eventlog", "plugplay", "winmgmt",
+    "lsm", "samss", "schedule", "power", "brokerinfrastructure",
+    "coremessagingregistrar", "systemeventsbroker", "profsvc", "usermanager",
+    "termservice", "lanmanserver", "lanmanworkstation", "dhcp", "dnscache",
+    "nsi", "cryptsvc", "keyiso", "vaultsvc", "wdiservicehost", "windefend",
+    "sens", "themes", "shellhwdetection", "seclogon",
 })
-_NAME = re.compile(r"^[A-Za-z0-9:_.@\\-]{1,255}\.(service|socket|timer|mount|path|target)$")
-_PROPS = ("ActiveState,SubState,Result,NRestarts,MainPID,ExecMainStatus,"
-          "ExecMainStartTimestampMonotonic,InactiveEnterTimestamp,Id")
+_NAME = re.compile(r"^[A-Za-z0-9_.$@ -]{1,256}$")
 TIMEOUT_S = 45.0
-
-
-def _argv(manager: str, *rest: str) -> list[str]:
-    return ["systemctl"] + (["--user"] if manager == "user" else []) + list(rest)
-
-
-def state(unit: str, manager: str = "system") -> dict[str, Any] | None:
-    """The unit's current state from `systemctl show`, or None when it
-    cannot be read (no systemd, no bus, no such unit)."""
-    text = linux.run(_argv(manager, "show", unit, "-p", _PROPS), timeout=10)
-    if not text:
-        return None
-    props: dict[str, str] = {}
-    for line in text.split("\n"):
-        key, sep, value = line.partition("=")
-        if sep:
-            props[key.strip()] = value.strip()
-    if not props.get("Id"):
-        return None
-    main_pid = props.get("MainPID")
-    restarts = props.get("NRestarts")
-    return {
-        "active": props.get("ActiveState") or None,
-        "sub": props.get("SubState") or None,
-        "result": props.get("Result") or None,
-        "main_pid": int(main_pid) if main_pid and main_pid.isdigit() and main_pid != "0" else None,
-        "restarts": int(restarts) if restarts and restarts.isdigit() else None,
-        "exit_status": props.get("ExecMainStatus") or None,
-    }
 
 
 def refuse(unit: str, verb: str, manager: str) -> str | None:
@@ -88,62 +63,86 @@ def refuse(unit: str, verb: str, manager: str) -> str | None:
     if verb not in VERBS:
         return f"unknown verb {verb!r}; expected one of {', '.join(VERBS)}"
     if manager not in MANAGERS:
-        return f"unknown manager {manager!r}; expected system or user"
-    if not isinstance(unit, str) or not _NAME.match(unit):
-        return "not a unit name (a .service, .socket, .timer, .mount, .path or .target)"
-    if unit in PROTECTED or unit.startswith("user@"):
-        return f"{unit} is a critical system unit; restarting it takes the machine or its sessions down"
-    own = linux.unit_from_cgroup(os.getpid())
-    if own and unit == own:
-        return f"{unit} is the unit running Culprit itself"
+        return f"unknown manager {manager!r}; Windows services have one manager (system)"
+    if not isinstance(unit, str) or not _NAME.match(unit) or unit != unit.strip():
+        return "not a service name"
+    if verb == "reset-failed":
+        return windows.not_capable("the Service Control Manager keeps no failed state "
+                                   "to reset; restart the service instead")
+    if unit.lower() in PROTECTED:
+        return f"{unit} is a service Windows cannot run without; restarting it takes the machine or its sessions down"
+    own = windows.own_service_name()
+    if own and unit.lower() == own.lower():
+        return f"{unit} is the task running Culprit itself"
     return None
 
 
+def state(unit: str, manager: str = "system") -> dict[str, Any] | None:  # noqa: ARG001
+    status = windows.service_status(unit)
+    if status is None:
+        return None
+    return {
+        "active": "active" if status["state"] == "running" else status["state"],
+        "sub": status["state"],
+        "result": (f"exit-code {status['exit_code']}" if status.get("exit_code")
+                   and status["exit_code"] not in (0, 1077) else None),
+        "restarts": None,
+        "pid": status.get("pid"),
+        "exit_status": status.get("exit_code"),
+    }
+
+
 def act(unit: str, verb: str, manager: str = "system") -> dict[str, Any]:
-    """Run one systemctl verb on a unit and report its state before and after."""
+    """Run one verb on a service and report its state before and after."""
     reason = refuse(unit, verb, manager)
     if reason:
         return {"ok": False, "reason": reason}
+    util = windows.win32serviceutil
+    if util is None:
+        return {"ok": False, "reason": windows.missing("win32serviceutil")}
     before = state(unit, manager)
+    if before is None:
+        return {"ok": False, "reason": f"no such service: {unit}"}
     started = time.perf_counter()
     try:
-        completed = subprocess.run(_argv(manager, verb, unit), capture_output=True,
-                                   text=True, timeout=TIMEOUT_S)
-    except FileNotFoundError:
-        return {"ok": False, "reason": "systemctl is not available on this machine"}
-    except subprocess.TimeoutExpired:
-        return {"ok": False,
-                "reason": (f"systemctl {verb} {unit} did not return within {TIMEOUT_S:.0f}s "
-                           "-- the unit is probably still stopping (TimeoutStopSec); "
-                           "its state will show in the next samples")}
-    except OSError as exc:
-        return {"ok": False, "reason": f"systemctl could not run: {exc}"}
-    elapsed_ms = round((time.perf_counter() - started) * 1000)
-    if completed.returncode != 0:
-        err = (completed.stderr or completed.stdout or "").strip()
-        lowered = err.lower()
-        if "authentication" in lowered or "access denied" in lowered or "permission" in lowered \
-                or "interactive authentication required" in lowered:
+        if verb == "start":
+            if before.get("sub") == "running":
+                return {"ok": True, "unit": unit, "verb": verb, "manager": manager,
+                        "before": before, "after": before, "elapsed_ms": 0,
+                        "note": "The service was already running; nothing was done."}
+            util.StartService(unit)
+            util.WaitForServiceStatus(unit, windows.win32service.SERVICE_RUNNING,  # type: ignore[union-attr]
+                                      int(TIMEOUT_S))
+        else:
+            # restart and reload-or-restart both: stop (if running), then start.
+            if before.get("sub") != "stopped":
+                util.StopService(unit)
+                util.WaitForServiceStatus(unit, windows.win32service.SERVICE_STOPPED,  # type: ignore[union-attr]
+                                          int(TIMEOUT_S))
+            util.StartService(unit)
+            util.WaitForServiceStatus(unit, windows.win32service.SERVICE_RUNNING,  # type: ignore[union-attr]
+                                      int(TIMEOUT_S))
+    except Exception as exc:  # noqa: BLE001 -- pywintypes.error and timeouts
+        text = windows.short_error(exc)
+        lowered = text.lower()
+        if "access is denied" in lowered or "denied" in lowered:
             return {"ok": False,
-                    "reason": (f"Permission denied: {verb} on a {manager} unit needs root, "
-                               "or a polkit rule granting org.freedesktop.systemd1."
-                               "manage-units to the agent's user.")}
-        if "not found" in lowered or "not loaded" in lowered:
-            return {"ok": False, "reason": f"systemctl: {err[:300] or 'no such unit'}"}
-        return {"ok": False, "reason": f"systemctl: {err[:300] or 'failed'}",
+                    "reason": (f"Permission denied: {verb} on {unit} needs the agent "
+                               "elevated (the SYSTEM task agent.ps1 sets up has it).")}
+        if "does not exist" in lowered or "not exist" in lowered:
+            return {"ok": False, "reason": f"no such service: {unit}"}
+        return {"ok": False, "reason": f"SCM: {text[:300] or 'failed'}",
                 "before": before, "after": state(unit, manager)}
-    # systemd reports the job done when the start job finishes; a Type=simple
-    # unit is "active" the moment its process is forked, so a crash a second
-    # later is only visible to the verdict watch, which is the point of it.
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
     time.sleep(0.3)
     after = state(unit, manager)
     note = None
-    if verb == "reset-failed":
-        note = "Only the failed state was cleared; nothing was started."
-    elif after and after.get("active") not in ("active", "activating", "reloading"):
-        note = (f"systemctl returned success but the unit is {after.get('active')} "
-                f"({after.get('sub')}); it may have exited straight away -- the "
-                "journal has its last words.")
+    if verb == "reload-or-restart":
+        note = "Windows services have no reload; the service was restarted."
+    if after and after.get("sub") != "running":
+        note = ((note + " ") if note else "") + (
+            f"The SCM reported success but the service is {after.get('sub')}; it "
+            "may have exited straight away -- the System event log has its last words.")
     return {
         "ok": True, "unit": unit, "verb": verb, "manager": manager,
         "before": before, "after": after, "elapsed_ms": elapsed_ms, "note": note,
@@ -151,8 +150,8 @@ def act(unit: str, verb: str, manager: str = "system") -> dict[str, Any]:
 
 
 def offered(kind: str, unit: str | None, root: str | None, manager: str) -> list[dict[str, Any]]:
-    """The action buttons an Outage item carries: verb, unit, and a label
-    that says what will be acted on. A failed unit with a different root
+    """The action buttons an Outage item carries: verb, service, and a label
+    that says what will be acted on. A failed service with a different root
     offers the root first (fixing the dependency is the fix), then itself."""
     verbs = OFFERED.get(kind) or ()
     if not verbs or not unit:
@@ -172,4 +171,4 @@ def offered(kind: str, unit: str | None, root: str | None, manager: str) -> list
 
 
 _VERB_WORD = {"restart": "Restart", "start": "Start",
-              "reload-or-restart": "Reload or restart", "reset-failed": "Reset failed state"}
+              "reload-or-restart": "Restart", "reset-failed": "Reset failed state"}

@@ -21,11 +21,16 @@ Scoring stays two-stage:
 2. Each process scored by its share of each resource, gated by that resource's
    pressure, with a 0.3 floor so the ranking stays meaningful on an idle box.
 
-The Windows "hung window" term is replaced by two kernel-level signals that are
-more direct evidence of a process being made to wait: sustained D-state
-(uninterruptible sleep -- `stuck`) and scheduler run delay from schedstat.
-Window responsiveness itself does not exist on a headless/Wayland Linux box
-and the UI says so instead of quietly omitting it.
+On Windows the kernel keeps no PSI, so the derived model *is* the model
+(`pressure_mode: derived`), and the one signal Windows has that Linux does
+not comes back: a window that has stopped pumping messages -- Task Manager's
+"Not responding" -- is the most direct "you are being made to wait" evidence
+there is, catching a process frozen at 0% CPU that no counter would ever
+flag. It is scored ungated (`weight_hung`), the way the Linux agent scores
+D-state, and raised as its own finding. The Linux-only inputs (`stuck`,
+`run_delay_ms`, cgroups, the kernel section) are simply absent here and the
+code paths that read them stay dormant; they are kept so the two agents'
+doctors read the same.
 """
 
 from __future__ import annotations
@@ -218,6 +223,9 @@ class LagAnalyzer:
                 # Ungated: a process stuck in uninterruptible sleep is being
                 # made to wait no matter what the aggregate counters say.
                 "stuck": cfg.weight_stuck if proc.get("stuck") else 0.0,
+                # Ungated too: a window that stopped answering is the wait
+                # itself, whatever the counters show.
+                "hung": getattr(cfg, "weight_hung", 2.0) if proc.get("hung") else 0.0,
             }
 
             raw = sum(terms.values())
@@ -683,6 +691,24 @@ class LagAnalyzer:
                 finding["blame"] = f"the {remote} server or the network to it"
                 finding["victims"] = True
             candidates.append(finding)
+
+        # --- Not responding (Windows: a window stopped pumping messages) ---
+        hung = [p for p in processes if p.get("hung")]
+        if hung:
+            names = ", ".join(sorted({str(p["name"]) for p in hung})[:4])
+            candidates.append({
+                "key": "hung_apps", "severity": "critical",
+                "title": f"{len(hung)} window{'s' if len(hung) != 1 else ''} not responding",
+                "detail": f"{names} stopped processing window messages. A frozen "
+                          "window usually means blocking I/O (a network share, a "
+                          "slow disk) or a deadlock, not CPU load -- the process "
+                          "sits at 0% while the user waits.",
+                "resource": "responsiveness",
+                "evidence": {"pids": [p["pid"] for p in hung],
+                             "titles": [str(p.get("hung_title") or "")[:80] for p in hung][:4]},
+                "sustained_ticks": cfg.sustain_ticks,
+                "hung": True,
+            })
 
         # Attribute each finding to the processes actually driving that resource.
         # An external finding lists no culprits -- unless the listed processes
@@ -1318,7 +1344,7 @@ _RESOURCE_SORT = {
     "disk": lambda p: -float(p.get("io_bytes_sec") or 0),
     "gpu": lambda p: -float(p.get("gpu") or 0),
     "storage": lambda p: -float(p.get("write_bytes_sec") or 0),
-    "responsiveness": lambda p: (0 if p.get("stuck") else 1,
+    "responsiveness": lambda p: (0 if (p.get("stuck") or p.get("hung")) else 1,
                                  -float(p.get("lag_score") or 0)),
 }
 
@@ -1328,7 +1354,7 @@ def _culprits(processes: list[dict], resource: str) -> list[dict[str, object]]:
     key = _RESOURCE_SORT.get(resource, _RESOURCE_SORT["cpu"])
     candidates = [p for p in processes if not p.get("is_kthread")]
     if resource == "responsiveness":
-        candidates = [p for p in candidates if p.get("stuck")] or candidates
+        candidates = [p for p in candidates if p.get("stuck") or p.get("hung")] or candidates
     if resource in ("disk", "storage"):
         # Per-process IO is permission-gated; blaming a process whose IO we
         # cannot read would be invention. Only measured, non-zero IO counts --
@@ -1350,7 +1376,7 @@ def _culprit_of(p: dict, resource: str) -> dict[str, object]:
         "pid": p["pid"], "name": p["name"], "username": p.get("username"),
         "cpu": p.get("cpu"), "working_set": p.get("working_set"),
         "io_bytes_sec": p.get("io_bytes_sec"), "gpu": p.get("gpu"),
-        "stuck": p.get("stuck"), "lag_score": p.get("lag_score"),
+        "stuck": p.get("stuck"), "hung": p.get("hung"), "lag_score": p.get("lag_score"),
         "share": _share_text(p, resource),
         "container": p.get("container"),
     }
@@ -1394,6 +1420,8 @@ def _share_text(proc: dict, resource: str) -> str:
     if resource == "gpu":
         return f"{float(proc.get('gpu') or 0):.0f}% GPU"
     if resource == "responsiveness":
+        if proc.get("hung"):
+            return "not responding"
         return "D-state" if proc.get("stuck") else ""
     if resource == "limits":
         handles = proc.get("handles")
@@ -1412,6 +1440,9 @@ def _reasons(proc: dict, mem_share: float) -> list[str]:
     can always say why.
     """
     out: list[str] = []
+    if proc.get("hung"):
+        title = str(proc.get("hung_title") or "")
+        out.append("Not responding" + (f" - {title[:60]}" if title else ""))
     if proc.get("stuck"):
         wchan = proc.get("wchan")
         out.append("Stuck in uninterruptible sleep"
@@ -1463,6 +1494,7 @@ def _reasons(proc: dict, mem_share: float) -> list[str]:
             "gpu": f"{gpu:.1f}% GPU",
             "faults": f"{faults:,.0f} page faults/s",
             "stuck": "uninterruptible sleep",
+            "hung": "not responding",
         }.get(top)
         if described:
             out.append(f"mostly {described}")
@@ -1476,6 +1508,7 @@ def _slim(proc: dict) -> dict[str, object]:
             "working_set", "private", "io_bytes_sec", "read_bytes_sec",
             "write_bytes_sec", "gpu", "vram", "threads", "page_faults_sec",
             "major_faults_sec", "run_delay_ms", "state", "stuck", "wchan",
+            "hung", "hung_title",
             "lag_score", "lag_breakdown", "lag_reasons", "exe", "container",
             "unit", "kernel",
         )

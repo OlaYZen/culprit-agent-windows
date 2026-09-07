@@ -1,339 +1,265 @@
-"""GPU utilisation and VRAM, per adapter and (where the driver allows) per PID.
+"""GPU utilisation and VRAM, per adapter *and* per process.
 
-Windows had one uniform per-process GPU API across all vendors; Linux does not,
-so this is a `GpuBackend` chain with honest degradation. Backends are probed in
-order of coverage and the first one that works wins; if none do, the payload
-says exactly why for each.
+Where the Linux agent has three backends (DRM fdinfo, NVML, amdgpu sysfs)
+and names which one answered, Windows has one uniform source that covers
+every vendor, so `backend` is always "pdh-gpu-engine". Engine keys are the
+WDDM engine classes (3D, Copy, VideoDecode, ...) rather than the Linux
+driver's names (render, video, ...); both sides label them for display.
 
-1. **DRM fdinfo** (cross-vendor, kernel >= ~5.19): /proc/<pid>/fdinfo/<fd> for
-   DRM fds exposes `drm-engine-<name>` busy-nanoseconds -- diffed over the
-   interval for a percentage. This is what nvtop and modern intel_gpu_top use.
-   Completeness varies by driver, and reading other users' fdinfo is
-   permission-gated just like /proc/<pid>/io.
-2. **NVML** (`pynvml`, optional dependency) for NVIDIA: adapter utilisation,
-   VRAM, and per-process memory via the compute/graphics process lists.
-3. **amdgpu sysfs**: /sys/class/drm/card*/device/gpu_busy_percent and the
-   mem_info_vram_* files. Adapter-level only.
+There is no NVML here on purpose. `nvidia-smi` only exists on NVIDIA hardware
+and gives nothing for the Intel/AMD integrated GPUs most corporate laptops
+actually have (this machine: Intel Iris Xe). The `\\GPU Engine` performance
+counters work on every WDDM 2.0+ adapter, need no elevation, and -- crucially --
+are keyed by PID, so they give the same per-process GPU column Task Manager has.
 
-On the dev VM (QEMU virtual display, NVIDIA driver not loaded) all three
-degrade, which exercised every unavailable path.
+Instance names look like:
+
+    pid_23324_luid_0x00000004_0xAB370C9F_phys_0_eng_0_engtype_3D
+    |         |                          |        |     `- engine class
+    |         |                          |        `- engine index within class
+    |         |                          `- physical adapter
+    |         `- adapter LUID
+    `- owning process
+
+Turning ~600 of those into meaningful numbers needs care, because naively
+summing everything produces utilisation well above 100%. A single instance's
+value is a percentage *of one engine's* time, so the aggregation is:
+
+    per engine (luid, phys, eng, engtype):  sum over PIDs      -> 0..100
+    per engine class:                       max over engines   -> 0..100
+    per adapter:                            max over classes   -> 0..100
+
+That matches what Task Manager reports and stays bounded. One PDH collect plus
+one array format costs 15-40ms in steady state, so the per-PID map is produced
+as a by-product of the adapter totals rather than by a second query.
 """
 
 from __future__ import annotations
 
-import logging
-import os
-import time
 from collections import defaultdict
 
-from .. import linux
+from .. import windows as pdh
 from ..util import clamp
 
-log = logging.getLogger("culprit.gpu")
+# Engine classes worth showing separately. Anything else Windows reports is
+# folded into "other" rather than dropped.
+_KNOWN_ENGINES = (
+    "3D", "Compute", "Copy", "VideoDecode", "VideoEncode", "VideoProcessing",
+    "Security", "Overlay", "Sensor",
+)
+
+_ENGINE_LABELS = {
+    "3D": "3D",
+    "Compute": "Compute",
+    "Copy": "Copy",
+    "VideoDecode": "Video decode",
+    "VideoEncode": "Video encode",
+    "VideoProcessing": "Video processing",
+    "Security": "Security",
+    "Overlay": "Overlay",
+    "Sensor": "Sensor",
+}
 
 
 class GpuCollector:
     def __init__(self, adapters: list[dict[str, object]] | None = None) -> None:
         self.adapters = adapters or []
+        self.query = pdh.PdhQuery("gpu")
+        # One full wildcard rather than one counter per engine class: fewer
+        # counters to collect, and the engine class is in the instance name.
+        self.has_engine = self.query.add(
+            "engine", r"\GPU Engine(*)\Utilization Percentage", array=True
+        )
+        self.has_proc_mem = self.query.add(
+            "proc_dedicated", r"\GPU Process Memory(*)\Dedicated Usage",
+            fmt="large", array=True,
+        )
+        self.query.add(
+            "proc_shared", r"\GPU Process Memory(*)\Shared Usage",
+            fmt="large", array=True,
+        )
+        self.query.add(
+            "adapter_dedicated", r"\GPU Adapter Memory(*)\Dedicated Usage",
+            fmt="large", array=True,
+        )
+        self.query.add(
+            "adapter_shared", r"\GPU Adapter Memory(*)\Shared Usage",
+            fmt="large", array=True,
+        )
+        self.query.add(
+            "adapter_committed", r"\GPU Adapter Memory(*)\Total Committed",
+            fmt="large", array=True,
+        )
+        # First collect on a ~600-instance wildcard costs ~550ms while PDH
+        # enumerates instances. Paid once, here, during startup warm-up.
+        self.query.collect()
+        # Latest per-PID view, consumed by the process collector on its own tick.
         self.per_pid: dict[int, dict[str, float]] = {}
-        self.backend: _Backend | None = None
-        self.reasons: dict[str, str] = {}
-        for candidate in (_FdinfoBackend(), _NvmlBackend(), _AmdSysfsBackend()):
-            reason = candidate.probe()
-            if reason is None:
-                self.backend = candidate
-                break
-            self.reasons[candidate.name] = reason
 
     @property
     def available(self) -> bool:
-        return self.backend is not None
+        return self.has_engine
 
     @property
     def reason(self) -> str | None:
-        if self.backend is not None:
+        if self.has_engine:
             return None
-        if not self.reasons:
-            return "no GPU backend probed"
-        return "; ".join(f"{name}: {why}" for name, why in self.reasons.items())
+        return self.query.unavailable.get(
+            "engine", "GPU performance counters are not present on this system"
+        )
 
     def sample(self) -> dict[str, object]:
-        if self.backend is None:
+        if not self.has_engine:
             return {
                 "available": False,
                 "reason": self.reason,
-                "backends_tried": dict(self.reasons),
+                "backends_tried": {"pdh-gpu-engine": self.reason},
                 "adapters": self.adapters,
                 "total": None,
                 "engines": [],
                 "process_count": 0,
             }
-        try:
-            payload = self.backend.sample()
-        except Exception as exc:
-            log.debug("gpu backend %s failed: %s", self.backend.name, exc)
-            return {"available": False,
-                    "reason": f"{self.backend.name} backend failed: {exc}",
-                    "adapters": self.adapters, "total": None, "engines": []}
-        self.per_pid = payload.pop("_per_pid", {})
-        payload.setdefault("adapters", self.adapters)
-        payload["available"] = True
-        payload["reason"] = None
-        payload["backend"] = self.backend.name
-        payload["process_count"] = len(self.per_pid)
-        return payload
 
-    def close(self) -> None:
-        if self.backend is not None:
-            self.backend.close()
+        self.query.collect()
+        engine_raw = self.query.array("engine")
 
-
-# ------------------------------------------------------------------- backends
-class _Backend:
-    name = "?"
-
-    def probe(self) -> str | None:
-        """None if usable, else the reason it is not."""
-        raise NotImplementedError
-
-    def sample(self) -> dict[str, object]:
-        raise NotImplementedError
-
-    def close(self) -> None:
-        pass
-
-
-class _FdinfoBackend(_Backend):
-    """Cross-vendor per-process engine time from DRM fdinfo."""
-
-    name = "drm-fdinfo"
-
-    def __init__(self) -> None:
-        # (pid, client_id, engine) -> (monotonic, busy_ns)
-        self._prev: dict[tuple[int, str, str], tuple[float, int]] = {}
-
-    def probe(self) -> str | None:
-        try:
-            cards = [c for c in os.listdir("/sys/class/drm")
-                     if c.startswith("card") and c[4:].isdigit()]
-        except OSError:
-            cards = []
-        if not cards:
-            return "no DRM devices under /sys/class/drm"
-        # A device counts only if some readable fdinfo actually exposes
-        # drm-engine counters; virtual displays (like this VM's) do not.
-        found = self._collect_raw(limit_pids=400)
-        if not found:
-            return ("no process exposes drm-engine-* fdinfo counters (virtual "
-                    "display, pre-5.19 kernel, or the driver does not "
-                    "implement them)")
-        return None
-
-    def sample(self) -> dict[str, object]:
-        now = time.monotonic()
-        raw = self._collect_raw()
+        # (luid, phys, eng, engtype) -> summed utilisation across processes
+        engines: dict[tuple[str, str, str, str], float] = defaultdict(float)
+        # pid -> engtype -> summed utilisation
         by_pid: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-        engine_util: dict[str, float] = defaultdict(float)
-        vram_by_pid: dict[int, int] = defaultdict(int)
 
-        for (pid, client, engine), (busy_ns, vram) in raw.items():
-            key = (pid, client, engine)
-            prev = self._prev.get(key)
-            self._prev[key] = (now, busy_ns)
-            if vram:
-                vram_by_pid[pid] = max(vram_by_pid[pid], vram)
-            if not prev or now <= prev[0]:
+        for instance, value in engine_raw.items():
+            if value <= 0.0:
                 continue
-            pct = clamp(100.0 * (busy_ns - prev[1]) / ((now - prev[0]) * 1e9))
-            by_pid[pid][engine] += pct
-            engine_util[engine] += pct
-
-        for key in set(self._prev) - set(raw):
-            self._prev.pop(key, None)
-
-        per_pid = {
-            pid: {"total": round(clamp(max(engines.values())), 2),
-                  "engines": {k: round(clamp(v), 2) for k, v in engines.items()},
-                  "vram_dedicated": vram_by_pid.get(pid, 0)}
-            for pid, engines in by_pid.items() if engines
-        }
-        total = round(max((clamp(v) for v in engine_util.values()), default=0.0), 2)
-        return {
-            "total": total,
-            "engines": [
-                {"key": key, "label": key.title(), "utilization": round(clamp(v), 2)}
-                for key, v in sorted(engine_util.items(), key=lambda kv: -kv[1])
-                if v > 0.005
-            ],
-            "memory": {"adapter_totals": {}},
-            "_per_pid": per_pid,
-        }
-
-    def _collect_raw(self, limit_pids: int | None = None
-                     ) -> dict[tuple[int, str, str], tuple[int, int]]:
-        """Walk readable /proc/<pid>/fdinfo entries for DRM counters.
-
-        Only fds pointing at /dev/dri/* are opened, found by readlink first --
-        reading every fdinfo of every process would be an order of magnitude
-        more file IO for nothing.
-        """
-        out: dict[tuple[int, str, str], tuple[int, int]] = {}
-        count = 0
-        try:
-            pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
-        except OSError:
-            return out
-        for pid in pids:
-            if limit_pids is not None and count >= limit_pids:
-                break
-            count += 1
-            fd_dir = f"/proc/{pid}/fd"
+            parsed = pdh.parse_gpu_instance(instance)
+            if not parsed:
+                continue
+            engtype = parsed.get("engtype") or "other"
+            if engtype not in _KNOWN_ENGINES:
+                engtype = "other"
+            key = (
+                parsed.get("luid") or "?",
+                parsed.get("phys") or "0",
+                parsed.get("eng") or "0",
+                engtype,
+            )
+            engines[key] += value
             try:
-                fds = os.listdir(fd_dir)
-            except OSError:
-                continue  # other user's process; counted by the process tier
-            for fd in fds:
-                try:
-                    target = os.readlink(f"{fd_dir}/{fd}")
-                except OSError:
-                    continue
-                if not target.startswith("/dev/dri/"):
-                    continue
-                info = linux.parse_kv_file(f"/proc/{pid}/fdinfo/{fd}")
-                client = info.get("drm-client-id", fd)
-                vram = 0
-                mem = info.get("drm-memory-vram") or info.get("drm-total-vram")
-                if mem and mem.split()[0].isdigit():
-                    vram = int(mem.split()[0]) * 1024  # reported in KiB
-                for key, value in info.items():
-                    if not key.startswith("drm-engine-"):
-                        continue
-                    engine = key.removeprefix("drm-engine-")
-                    try:
-                        busy_ns = int(value.split()[0])
-                    except (ValueError, IndexError):
-                        continue
-                    slot = (pid, client, engine)
-                    # A process can hold several fds to one DRM client;
-                    # keep the max, not the sum, or it double-counts.
-                    if slot not in out or out[slot][0] < busy_ns:
-                        out[slot] = (busy_ns, vram)
-        return out
-
-
-class _NvmlBackend(_Backend):
-    name = "nvml"
-
-    def __init__(self) -> None:
-        self._nvml = None
-        self._handles: list = []
-
-    def probe(self) -> str | None:
-        try:
-            import pynvml  # optional, lazily imported
-        except ImportError:
-            return "pynvml is not installed (pip install nvidia-ml-py)"
-        try:
-            pynvml.nvmlInit()
-        except Exception as exc:
-            return f"NVML init failed: {exc} (NVIDIA driver not loaded?)"
-        self._nvml = pynvml
-        count = pynvml.nvmlDeviceGetCount()
-        if count == 0:
-            return "NVML reports no devices"
-        self._handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
-        return None
-
-    def sample(self) -> dict[str, object]:
-        nvml = self._nvml
-        adapters = []
-        per_pid: dict[int, dict[str, float]] = {}
-        total = 0.0
-        vram_used = vram_total = 0
-        for handle in self._handles:
-            util = nvml.nvmlDeviceGetUtilizationRates(handle)
-            mem = nvml.nvmlDeviceGetMemoryInfo(handle)
-            name = nvml.nvmlDeviceGetName(handle)
-            if isinstance(name, bytes):
-                name = name.decode()
-            total = max(total, float(util.gpu))
-            vram_used += mem.used
-            vram_total += mem.total
-            adapters.append({"name": name, "utilization": float(util.gpu),
-                             "vram_dedicated": mem.used, "vram_total": mem.total,
-                             "integrated": False})
-            for getter in (nvml.nvmlDeviceGetComputeRunningProcesses,
-                           nvml.nvmlDeviceGetGraphicsRunningProcesses):
-                try:
-                    for proc in getter(handle):
-                        slot = per_pid.setdefault(
-                            proc.pid, {"total": 0.0, "engines": {},
-                                       "vram_dedicated": 0})
-                        used = getattr(proc, "usedGpuMemory", None)
-                        if used:
-                            slot["vram_dedicated"] += used
-                except Exception:  # noqa: BLE001 -- per-proc list is best-effort
-                    pass
-        return {
-            "total": round(total, 2),
-            "engines": [{"key": "gpu", "label": "GPU",
-                         "utilization": round(total, 2)}] if total else [],
-            "adapters": adapters,
-            "memory": {"adapter_totals": {"vram_dedicated": vram_used,
-                                          "vram_total": vram_total}},
-            "_per_pid": per_pid,
-        }
-
-    def close(self) -> None:
-        if self._nvml is not None:
-            try:
-                self._nvml.nvmlShutdown()
-            except Exception:
+                by_pid[int(parsed["pid"])][engtype] += value
+            except (KeyError, TypeError, ValueError):
                 pass
 
+        # Engine class -> max across the physical engines of that class.
+        class_util: dict[str, float] = defaultdict(float)
+        # LUID -> max across all its engine classes, i.e. that adapter's load.
+        adapter_util: dict[str, float] = defaultdict(float)
+        for (luid, _phys, _eng, engtype), value in engines.items():
+            bounded = clamp(value)
+            class_util[engtype] = max(class_util[engtype], bounded)
+            adapter_util[luid] = max(adapter_util[luid], bounded)
 
-class _AmdSysfsBackend(_Backend):
-    """amdgpu's sysfs files. Adapter totals only -- no per-PID view here."""
-
-    name = "amdgpu-sysfs"
-
-    def __init__(self) -> None:
-        self._cards: list[str] = []
-
-    def probe(self) -> str | None:
-        try:
-            for card in os.listdir("/sys/class/drm"):
-                if not (card.startswith("card") and card[4:].isdigit()):
-                    continue
-                if os.path.exists(f"/sys/class/drm/{card}/device/gpu_busy_percent"):
-                    self._cards.append(card)
-        except OSError:
-            pass
-        if not self._cards:
-            return "no /sys/class/drm/card*/device/gpu_busy_percent (not amdgpu)"
-        return None
-
-    def sample(self) -> dict[str, object]:
-        adapters = []
-        total = 0.0
-        vram_used = vram_total = 0
-        for card in self._cards:
-            base = f"/sys/class/drm/{card}/device"
-            busy = linux.read_int(f"{base}/gpu_busy_percent") or 0
-            used = linux.read_int(f"{base}/mem_info_vram_used") or 0
-            cap = linux.read_int(f"{base}/mem_info_vram_total") or 0
-            total = max(total, float(busy))
-            vram_used += used
-            vram_total += cap
-            adapters.append({"name": f"AMD GPU ({card})", "utilization": busy,
-                             "vram_dedicated": used, "vram_total": cap,
-                             "integrated": False})
-        return {
-            "total": round(total, 2),
-            "engines": [{"key": "gpu", "label": "GPU",
-                         "utilization": round(total, 2)}] if total else [],
-            "adapters": adapters,
-            "memory": {"adapter_totals": {"vram_dedicated": vram_used,
-                                          "vram_total": vram_total}},
-            "_per_pid": {},
+        self.per_pid = {
+            pid: {
+                "total": round(clamp(max(per_engine.values())), 2),
+                "engines": {k: round(clamp(v), 2) for k, v in per_engine.items()},
+            }
+            for pid, per_engine in by_pid.items()
+            if per_engine
         }
+
+        memory = self._memory()
+        overall = round(max(class_util.values()), 2) if class_util else 0.0
+
+        engine_list = [
+            {
+                "key": key,
+                "label": _ENGINE_LABELS.get(key, key.title()),
+                "utilization": round(value, 2),
+            }
+            for key, value in sorted(class_util.items(), key=lambda kv: -kv[1])
+            if value > 0.005
+        ]
+
+        adapters = []
+        for index, adapter in enumerate(self.adapters or [{"name": "GPU"}]):
+            entry = dict(adapter)
+            # Adapter identity in WMI and in PDH instance names cannot be joined
+            # reliably (no shared LUID field), so a single-GPU machine -- the
+            # overwhelming majority -- gets the aggregate, and multi-GPU boxes
+            # get per-LUID rows listed separately below.
+            entry["utilization"] = overall if len(self.adapters) <= 1 else None
+            entry.update(memory.get("adapter_totals", {}) if index == 0 else {})
+            adapters.append(entry)
+
+        return {
+            "available": True,
+            "reason": None,
+            "backend": "pdh-gpu-engine",
+            "total": overall,
+            "engines": engine_list,
+            "adapters": adapters,
+            "per_luid": [
+                {"luid": luid, "utilization": round(value, 2)}
+                for luid, value in sorted(adapter_util.items(), key=lambda kv: -kv[1])
+            ],
+            "memory": memory,
+            "process_count": len(self.per_pid),
+        }
+
+    # -------------------------------------------------------------- VRAM
+    def _memory(self) -> dict[str, object]:
+        dedicated = self.query.array("adapter_dedicated")
+        shared = self.query.array("adapter_shared")
+        committed = self.query.array("adapter_committed")
+
+        def total(values: dict[str, float]) -> int | None:
+            usable = [v for k, v in values.items() if k != "_Total"]
+            return int(sum(usable)) if usable else None
+
+        proc_dedicated = self.query.array("proc_dedicated")
+        proc_shared = self.query.array("proc_shared")
+        per_pid_mem: dict[int, dict[str, int]] = defaultdict(
+            lambda: {"dedicated": 0, "shared": 0}
+        )
+        for source, field in ((proc_dedicated, "dedicated"), (proc_shared, "shared")):
+            for instance, value in source.items():
+                parsed = pdh.parse_gpu_instance(instance)
+                if not parsed:
+                    continue
+                try:
+                    per_pid_mem[int(parsed["pid"])][field] += int(value)
+                except (KeyError, TypeError, ValueError):
+                    pass
+
+        # Fold VRAM into the per-PID view the process table reads.
+        for pid, mem in per_pid_mem.items():
+            slot = self.per_pid.setdefault(pid, {"total": 0.0, "engines": {}})
+            slot["vram_dedicated"] = mem["dedicated"]
+            slot["vram_shared"] = mem["shared"]
+
+        return {
+            "adapter_totals": {
+                "vram_dedicated": total(dedicated),
+                "vram_shared": total(shared),
+                "vram_committed": total(committed),
+                # Capacity is not a PDH counter; Win32_VideoController's
+                # AdapterRAM wraps at 4 GB, so it is a hint, not a budget.
+                "vram_total": _capacity(self.adapters),
+            },
+            "process_count": len(per_pid_mem),
+        }
+
+    def close(self) -> None:
+        self.query.close()
+
+
+def _capacity(adapters: list[dict[str, object]]) -> int | None:
+    """Sum of the adapters' reported RAM when it is trustworthy (below the
+    uint32 wrap), else None -- never a wrong number dressed as a total."""
+    total = 0
+    for adapter in adapters or []:
+        ram = adapter.get("adapter_ram")
+        if not isinstance(ram, int) or ram <= 0 or ram >= 4 * 1024 ** 3 - 1:
+            return None
+        total += ram
+    return total or None

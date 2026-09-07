@@ -2,235 +2,189 @@
 
 Split across two cadences because the two questions are different:
 
-* fast tick -- *is the disk the bottleneck right now?* Answered from
-  /proc/diskstats deltas: await-style latency and queue depth, not throughput.
-  A disk saturated at 100% busy with 2ms latency is fine; one at 40% busy with
-  80ms latency is why the UI is frozen.
-* slow tick -- *am I running out of space?* Mount enumeration touches the
-  filesystem, and network/auto mounts can block for seconds (the same failure
-  as Windows' disconnected network drives), so they are filtered before any
-  statvfs call.
+* fast tick -- *is the disk the bottleneck right now?* Answered by queue depth
+  and `Avg. Disk sec/Transfer` (latency), not by throughput. A disk saturated at
+  100% busy with 2ms latency is fine; one at 40% busy with 80ms latency is why
+  the UI is frozen.
+* slow tick -- *am I running out of space?* Volume enumeration touches the
+  filesystem and can block on a disconnected network drive, so it is kept off
+  the hot path and network/removable drives are skipped.
 
-The %util caveat, carried over and sharpened: on multi-queue NVMe both
-`ms_doing_io` (busy%) and `ios_in_progress` (queue) are much weaker signals
-than on single-queue devices, because independent hardware queues overlap.
-Latency is the number to lead with; the UI says so.
+The payload is the Linux agent's shape. What Windows cannot say is said as
+such: there is no ext4-style root reserve (`reserved` is None), no
+deleted-but-open file can exist (Windows refuses the delete, so
+`held_deleted` is always empty and the truncate verb never applies), and
+per-file write rates would cost `open_files()` on every process -- ~250 ms
+each on Windows -- so writers are reported as gated with that reason rather
+than attributed by guesswork. The fill forecast is pure arithmetic over
+capacity samples and is ported from the Linux collector unchanged.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import deque
 
-from .. import linux
+import psutil
+
+from .. import windows
 from ..util import clamp
+from .cpu_mem import media_rotational
 
 log = logging.getLogger("culprit.disks")
 
-_SECTOR = 512  # /proc/diskstats sector counts are always 512-byte units
-
-# Filesystems that are memory, packaging or plumbing rather than storage.
-_SKIP_FSTYPES = {
-    "tmpfs", "devtmpfs", "squashfs", "overlay", "ramfs", "proc", "sysfs",
-    "cgroup", "cgroup2", "devpts", "securityfs", "debugfs", "tracefs",
-    "pstore", "bpf", "autofs", "mqueue", "hugetlbfs", "configfs", "fusectl",
-    "binfmt_misc", "rpc_pipefs", "nsfs", "efivarfs", "fuse.snapfuse",
-    "fuse.portal", "fuse.gvfsd-fuse",
-}
-# These can block for seconds when the far end is gone; statvfs on them is how
-# a monitoring tool hangs its own sampler.
-_NETWORK_FSTYPES = {"nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.sshfs",
-                    "9p", "ceph", "glusterfs", "afs"}
+_PHYSICAL_COUNTERS: tuple[tuple[str, str, str], ...] = (
+    ("read_bytes", r"\PhysicalDisk(*)\Disk Read Bytes/sec", "double"),
+    ("write_bytes", r"\PhysicalDisk(*)\Disk Write Bytes/sec", "double"),
+    ("reads", r"\PhysicalDisk(*)\Disk Reads/sec", "double"),
+    ("writes", r"\PhysicalDisk(*)\Disk Writes/sec", "double"),
+    ("queue", r"\PhysicalDisk(*)\Current Disk Queue Length", "double"),
+    ("idle", r"\PhysicalDisk(*)\% Idle Time", "double"),
+    ("latency", r"\PhysicalDisk(*)\Avg. Disk sec/Transfer", "double"),
+    ("read_latency", r"\PhysicalDisk(*)\Avg. Disk sec/Read", "double"),
+    ("write_latency", r"\PhysicalDisk(*)\Avg. Disk sec/Write", "double"),
+    ("split_io", r"\PhysicalDisk(*)\Split IO/Sec", "double"),
+)
 
 
 class DiskCollector:
-    """Fast-tick physical disk activity from /proc/diskstats."""
+    """Fast-tick physical disk activity."""
 
     def __init__(self) -> None:
-        self._devices = _whole_devices()
-        self._prev: dict[str, tuple[float, dict[str, int]]] = {}
-        self._prev_at = 0.0
-        self.sample()  # prime the deltas
+        self.query = windows.PdhQuery("disk")
+        for key, path, fmt in _PHYSICAL_COUNTERS:
+            self.query.add(key, path, fmt=fmt, array=True)
+        self.query.collect()
+        self._rotational: dict[int, bool | None] = {}
+        self._rotational_at = 0.0
 
     def sample(self) -> dict[str, object]:
-        now = time.monotonic()
-        stats = _read_diskstats(self._devices)
+        self.query.collect()
+        arrays = {key: self.query.array(key) for key, _, _ in _PHYSICAL_COUNTERS}
+
+        # PhysicalDisk instances are "0 C:" / "1 D: E:" / "_Total".
+        names = sorted(
+            {name for array in arrays.values() for name in array}
+            - {"_Total"},
+            key=_disk_sort_key,
+        )
+        if names and time.monotonic() - self._rotational_at > 300:
+            self._rotational = _rotational_by_index()
+            self._rotational_at = time.monotonic()
+
         disks = []
-        total = {"read_bytes_sec": 0.0, "write_bytes_sec": 0.0,
-                 "reads_sec": 0.0, "writes_sec": 0.0, "queue_length": 0.0,
-                 "busy_ms": 0.0, "io_ms": 0.0, "ios": 0.0,
-                 "read_total": 0, "write_total": 0}
-
-        physical_count = 0
-        for name, row in stats.items():
-            layered = bool(self._devices.get(name, {}).get("layered"))
-            prev = self._prev.get(name)
-            self._prev[name] = (now, row)
-            if not layered:
-                total["read_total"] += row["sectors_read"] * _SECTOR
-                total["write_total"] += row["sectors_written"] * _SECTOR
-            if not prev or now <= prev[0]:
-                continue
-            dt = now - prev[0]
-            d = {key: max(0, row[key] - prev[1].get(key, 0)) for key in row}
-
-            reads = d["reads"] / dt
-            writes = d["writes"] / dt
-            read_bytes = d["sectors_read"] * _SECTOR / dt
-            write_bytes = d["sectors_written"] * _SECTOR / dt
-            ios = d["reads"] + d["writes"]
-            # await, exactly as iostat computes it: total time waited divided
-            # by IOs completed. The most honest "how slow is storage" number.
-            latency = ((d["ms_reading"] + d["ms_writing"]) / ios) if ios else 0.0
-            read_latency = (d["ms_reading"] / d["reads"]) if d["reads"] else 0.0
-            write_latency = (d["ms_writing"] / d["writes"]) if d["writes"] else 0.0
-            busy = clamp(100.0 * d["ms_doing_io"] / (dt * 1000.0))
-            merged = (d["reads_merged"] + d["writes_merged"]) / dt
-
-            rotational = self._devices.get(name, {}).get("rotational")
+        for name in names:
+            idle = arrays["idle"].get(name)
+            busy = None if idle is None else clamp(100.0 - idle)
+            latency = arrays["latency"].get(name)
+            index = _disk_index(name)
             disks.append({
                 "instance": name,
-                "layered": layered,
-                "index": None,          # Linux disks have names, not indexes
-                "letters": name,        # what the per-disk rows display
-                "rotational": rotational,
-                "read_bytes_sec": round(read_bytes),
-                "write_bytes_sec": round(write_bytes),
-                "reads_sec": round(reads, 1),
-                "writes_sec": round(writes, 1),
-                "queue_length": row["ios_in_progress"],
-                "busy_percent": round(busy, 1),
-                "latency_ms": round(latency, 2),
-                "read_latency_ms": round(read_latency, 2),
-                "write_latency_ms": round(write_latency, 2),
-                "merged_io_sec": round(merged, 1),
+                "index": index,
+                "letters": _disk_letters(name),
+                "layered": False,
+                "rotational": self._rotational.get(index) if index is not None else None,
+                "read_bytes_sec": _num(arrays["read_bytes"].get(name)),
+                "write_bytes_sec": _num(arrays["write_bytes"].get(name)),
+                "reads_sec": _num(arrays["reads"].get(name), 1),
+                "writes_sec": _num(arrays["writes"].get(name), 1),
+                "queue_length": _num(arrays["queue"].get(name), 2),
+                "busy_percent": None if busy is None else round(busy, 1),
+                # PDH reports seconds; milliseconds is what people reason about.
+                "latency_ms": None if latency is None else round(latency * 1000, 2),
+                "read_latency_ms": _ms(arrays["read_latency"].get(name)),
+                "write_latency_ms": _ms(arrays["write_latency"].get(name)),
+                "split_io_sec": _num(arrays["split_io"].get(name), 1),
+                # Linux counts block-layer merges; Windows counts the opposite
+                # (split IO) and has no merge counter.
+                "merged_io_sec": None,
             })
 
-            if layered:
-                continue  # already counted through the underlying disk
-            physical_count += 1
-            total["read_bytes_sec"] += read_bytes
-            total["write_bytes_sec"] += write_bytes
-            total["reads_sec"] += reads
-            total["writes_sec"] += writes
-            total["queue_length"] += row["ios_in_progress"]
-            total["busy_ms"] += d["ms_doing_io"]
-            total["io_ms"] += d["ms_reading"] + d["ms_writing"]
-            total["ios"] += ios
+        totals_idle = arrays["idle"].get("_Total")
+        total_latency = arrays["latency"].get("_Total")
+        try:
+            counters = psutil.disk_io_counters()
+        except Exception:  # noqa: BLE001 -- no disks at all is a real case
+            counters = None
 
-        elapsed = (now - self._prev_at) if self._prev_at else 0.0
-        self._prev_at = now
-        device_count = max(1, physical_count)
-
+        available = bool(names) or counters is not None
         return {
-            "available": bool(stats),
-            "reason": None if stats else "/proc/diskstats listed no whole block devices",
-            "disks": sorted(disks, key=lambda d: d["instance"]),
+            "available": available,
+            "reason": None if names else (self.query.unavailable.get("queue")
+                                          or self.query.reason),
+            "disks": disks,
             "total": {
-                "read_bytes_sec": round(total["read_bytes_sec"]),
-                "write_bytes_sec": round(total["write_bytes_sec"]),
-                "reads_sec": round(total["reads_sec"], 1),
-                "writes_sec": round(total["writes_sec"], 1),
-                "queue_length": round(total["queue_length"], 2),
-                # Busy% averaged across devices so one idle disk of two reads
-                # as 50%, matching what the per-disk rows show.
-                "busy_percent": (
-                    round(clamp(100.0 * total["busy_ms"]
-                                / (elapsed * 1000.0 * device_count)), 1)
-                    if elapsed and disks else None
-                ),
-                "latency_ms": (round(total["io_ms"] / total["ios"], 2)
-                               if total["ios"] else 0.0),
-                "read_total": total["read_total"],
-                "write_total": total["write_total"],
+                "read_bytes_sec": _num(arrays["read_bytes"].get("_Total")),
+                "write_bytes_sec": _num(arrays["write_bytes"].get("_Total")),
+                "reads_sec": _num(arrays["reads"].get("_Total"), 1),
+                "writes_sec": _num(arrays["writes"].get("_Total"), 1),
+                "queue_length": _num(arrays["queue"].get("_Total"), 2),
+                "busy_percent": None if totals_idle is None
+                                else round(clamp(100.0 - totals_idle), 1),
+                "latency_ms": None if total_latency is None
+                              else round(total_latency * 1000, 2),
+                # Cumulative, for the "since boot" readout.
+                "read_total": getattr(counters, "read_bytes", None),
+                "write_total": getattr(counters, "write_bytes", None),
             },
         }
 
     def close(self) -> None:
-        pass
+        self.query.close()
 
 
 class VolumeCollector:
-    """Slow-tick mount capacity + block-device identity."""
+    """Slow-tick volume capacity + physical drive media info."""
 
     def __init__(self) -> None:
         self._media: list[dict[str, object]] | None = None
         # mountpoint -> (epoch, used bytes) ring for the fill forecast.
         self._history: dict[str, deque[tuple[float, int]]] = {}
-        # (pid, fd, path) -> (epoch, file offset) from the previous tick, so
-        # each open file's write rate is the offset it advanced per second.
-        self._offsets: dict[tuple[int, str, str], tuple[float, int]] = {}
-        self._started = time.time()
 
-    def sample(self, processes: list[dict] | None = None) -> dict[str, object]:
-        """`processes` (the latest process table) lets each mount name the
-        processes writing to it and the deleted files still held open."""
+    def sample(self, processes: list[dict] | None = None) -> dict[str, object]:  # noqa: ARG002
         volumes = []
         skipped = []
-        seen_devices: set[str] = set()
-        # A second mount of a device already reported (a btrfs subvolume
-        # such as /home or /var/log, a bind mount) is not a second volume,
-        # but files under it still live on that volume: remember which one,
-        # so a writer under /home is charged to / and not to nothing.
-        first_mount: dict[str, str] = {}
-        aliases: dict[str, str] = {}
         now = time.time()
-        all_mounts = _mounts()
-        for mount in all_mounts:
-            fstype, mountpoint, source, options = (
-                mount["fstype"], mount["mountpoint"], mount["source"],
-                mount["options"])
-            base_type = fstype.split(".")[0]
-            if fstype in _SKIP_FSTYPES or base_type in _SKIP_FSTYPES:
+        try:
+            partitions = psutil.disk_partitions(all=False)
+        except Exception as exc:  # noqa: BLE001
+            partitions = []
+            skipped.append({"device": "?", "reason": f"disk_partitions failed: {exc}"})
+        for part in partitions:
+            # 'cdrom' with no media, and mapped network drives that are offline,
+            # both block for seconds inside disk_usage(). Filter first.
+            opts = (part.opts or "").lower()
+            if "cdrom" in opts or part.fstype == "":
+                skipped.append({"device": part.device, "reason": "no media"})
                 continue
-            if fstype in _NETWORK_FSTYPES or base_type in _NETWORK_FSTYPES:
-                # statvfs on a dead NFS/CIFS mount blocks for seconds inside
-                # the kernel with no way to time it out from here.
-                skipped.append({"device": source,
-                                "reason": f"network filesystem ({fstype}) -- "
-                                          "not probed, it can hang the sampler"})
+            if _is_remote(part.device):
+                skipped.append({"device": part.device,
+                                "reason": "network drive -- not probed, it can hang the sampler"})
                 continue
-            if source in seen_devices:
-                aliases[mountpoint] = first_mount[source]
-                continue  # bind mounts and btrfs subvolumes repeat the device
-            seen_devices.add(source)
-            first_mount[source] = mountpoint
             try:
-                usage = os.statvfs(mountpoint)
+                usage = psutil.disk_usage(part.mountpoint)
             except OSError as exc:
-                skipped.append({"device": source, "reason": str(exc)})
+                skipped.append({"device": part.device, "reason": str(exc)})
                 continue
-            frsize = usage.f_frsize or usage.f_bsize
-            total = usage.f_blocks * frsize
-            if total == 0:
+            if usage.total == 0:
                 continue
-            # f_bavail, not f_bfree: ext4 reserves ~5% for root, and reporting
-            # root's number to a user overstates what they can actually write.
-            free = usage.f_bavail * frsize
-            reserved = max(0, (usage.f_bfree - usage.f_bavail)) * frsize
-            used = total - usage.f_bfree * frsize
-            usable = used + free
             volumes.append({
-                "device": source,
-                "mountpoint": mountpoint,
-                "fstype": fstype,
-                "opts": options,
-                "readonly": "ro" in options.split(","),
-                "label": _label_for(source),
-                "total": total,
-                "used": used,
-                "free": free,
-                "reserved": reserved,
-                "percent": round(100.0 * used / usable, 1) if usable else 0.0,
+                "device": part.device,
+                "mountpoint": part.mountpoint,
+                "fstype": part.fstype,
+                "opts": part.opts,
+                "readonly": "ro" in opts.split(","),
+                "label": _volume_label(part.mountpoint),
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+                # NTFS keeps no root reserve; the whole free figure is usable.
+                "reserved": None,
+                "percent": round(usage.percent, 1),
             })
         volumes.sort(key=lambda v: v["mountpoint"])
 
-        # Fill forecast: a least-squares slope over the last hour of samples
-        # (at least ten minutes), stated as a rate and a time to full. The
-        # ring lives in the agent, so it starts empty after a restart and
-        # says so rather than guessing from two points.
         live = {v["mountpoint"] for v in volumes}
         for gone in [m for m in self._history if m not in live]:
             del self._history[gone]
@@ -242,47 +196,142 @@ class VolumeCollector:
                 ring.popleft()
             volume["forecast"] = _forecast(ring, int(volume["free"]),
                                            int(volume["total"]), now)
-
-        reported = {str(v["mountpoint"]) for v in volumes}
-        writers, held, gated, files = _writers(
-            volumes, processes or [],
-            every_mount=[str(m["mountpoint"]) for m in all_mounts],
-            offsets=self._offsets, now=now,
-            aliases={m: v for m, v in aliases.items() if v in reported})
-        for volume in volumes:
-            mount = str(volume["mountpoint"])
-            volume["writers"] = writers.get(mount, [])
-            volume["held_deleted"] = held.get(mount, [])
-            volume["files"] = files.get(mount, [])
+            volume["writers"] = []
+            volume["held_deleted"] = []
+            volume["files"] = []
 
         if self._media is None:
-            self._media = _block_media()
+            self._media = _physical_media()
 
+        writing = sum(1 for p in (processes or [])
+                      if float(p.get("write_bytes_sec") or 0) > 0)
         return {
             "volumes": volumes,
             "skipped": skipped,
             "media": self._media or [],
-            "writers_gated": gated,
+            "writers_gated": writing,
             "writers_note": (
-                f"{gated} writing process(es) could not be attributed to a mount: "
-                "their open files are not readable at this privilege level "
-                "(CAP_SYS_PTRACE or root for other users' descriptors)."
-                if gated else None),
-            # How a file's rate is measured, stated once so the UI can say it.
-            "files_method": ("the offset of each writable descriptor, read from "
-                             "/proc/<pid>/fdinfo between samples: sequential "
-                             "writes exactly, mmap and pwrite not at all"),
+                f"{writing} writing process(es) are not attributed to a volume: "
+                "naming a process's open files costs ~250 ms per process on "
+                "Windows (NtQuerySystemInformation handle walk), which the slow "
+                "tier cannot afford for every process. Their write rates are in "
+                "the process table." if writing else None),
+            "files_method": windows.not_capable(
+                "per-file write rates come from /proc/<pid>/fdinfo offsets on "
+                "Linux; Windows exposes no descriptor offsets to another process"),
         }
 
 
+def _is_remote(device: str) -> bool:
+    return device.startswith("\\\\") or device.startswith("//")
+
+
+def _volume_label(mountpoint: str) -> str | None:
+    if windows.win32api is None:
+        return None
+    try:
+        # (name, serial, max_component, flags, fstype)
+        return windows.win32api.GetVolumeInformation(mountpoint)[0] or None
+    except Exception:
+        return None
+
+
+def _rotational_by_index() -> dict[int, bool | None]:
+    out: dict[int, bool | None] = {}
+    for row in windows.wmi_query(
+            "SELECT DeviceId, MediaType FROM MSFT_PhysicalDisk",
+            ("DeviceId", "MediaType"),
+            namespace=r"winmgmts:\\.\root\Microsoft\Windows\Storage"):
+        try:
+            out[int(str(row.get("DeviceId")))] = media_rotational(row.get("MediaType"))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _physical_media() -> list[dict[str, object]]:
+    """Model / bus / media type per physical drive, plus the SMART flag.
+
+    `Win32_DiskDrive.Status` and `PredictFailure` are the only failure signals a
+    standard user can read; full SMART attributes need elevation and a vendor
+    interface. A "Pred Fail" here is worth surfacing loudly, but its absence is
+    not a clean bill of health -- `smart_reason` says so when it is unknown.
+    """
+    out: dict[str, dict[str, object]] = {}
+    rotational = _rotational_by_index()
+    for drive in windows.wmi_query(
+        "SELECT DeviceID, Index, Model, InterfaceType, MediaType, Size, "
+        "SerialNumber, Status, Partitions, FirmwareRevision FROM Win32_DiskDrive",
+        ("DeviceID", "Index", "Model", "InterfaceType", "MediaType", "Size",
+         "SerialNumber", "Status", "Partitions", "FirmwareRevision"),
+    ):
+        index = drive.get("Index")
+        try:
+            index_int = int(index)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            index_int = None
+        media_type = drive.get("MediaType")
+        rot = rotational.get(index_int) if index_int is not None else None
+        if rot is True:
+            media_type = "HDD"
+        elif rot is False:
+            media_type = "SSD"
+        out[str(index)] = {
+            "index": index_int,
+            "name": str(drive.get("DeviceID") or f"PhysicalDrive{index}"),
+            "model": str(drive.get("Model") or "").strip(),
+            "interface": drive.get("InterfaceType"),
+            "media_type": media_type,
+            "size": _int(drive.get("Size")),
+            "serial": str(drive.get("SerialNumber") or "").strip() or None,
+            "status": drive.get("Status"),
+            "partitions": drive.get("Partitions"),
+            "firmware": str(drive.get("FirmwareRevision") or "").strip() or None,
+            "predict_failure": None,
+            "predict_reason": None,
+            "smart_reason": None,
+        }
+
+    # MSStorageDriver_FailurePredictStatus lives in root\wmi and carries the
+    # actual "this drive is dying" bit. Frequently access-denied unelevated, so
+    # its absence means "unknown", never "healthy".
+    rows = windows.wmi_query(
+        "SELECT InstanceName, PredictFailure, Reason "
+        "FROM MSStorageDriver_FailurePredictStatus",
+        ("InstanceName", "PredictFailure", "Reason"),
+        namespace=r"winmgmts:\\.\root\wmi",
+    )
+    matched: set[str] = set()
+    for row in rows:
+        instance = str(row.get("InstanceName") or "").lower()
+        predict = bool(row.get("PredictFailure"))
+        for key, entry in out.items():
+            model = str(entry.get("model", ""))
+            if model and model[:12].lower() in instance:
+                entry["predict_failure"] = predict
+                entry["predict_reason"] = row.get("Reason")
+                matched.add(key)
+    for key, entry in out.items():
+        if key in matched:
+            continue
+        entry["smart_reason"] = (
+            "the failure-prediction bit (MSStorageDriver_FailurePredictStatus) "
+            "is not readable: run the agent elevated, or the drive does not report it"
+            if not rows else "no failure-prediction record matched this drive's model")
+    if not out:
+        log.debug("Win32_DiskDrive returned nothing: %s", windows.wmi_reason())
+    return list(out.values())
+
+
 # -------------------------------------------------------------------- forecast
+# Ported verbatim from the Linux collector: it is arithmetic over samples.
 _FORECAST_KEEP_SECONDS = 6 * 3600
 _FORECAST_WINDOW_SECONDS = 3600
 _FORECAST_MIN_SECONDS = 600
 _STABLE_BYTES_PER_DAY = 64 * 1024 ** 2
 
 
-def _forecast(ring: deque[tuple[float, int]], free: int, total: int,
+def _forecast(ring: deque[tuple[float, int]], free: int, total: int,  # noqa: ARG001
               now: float) -> dict[str, object]:
     """Least-squares slope of used bytes over the recent window."""
     window = [(t, u) for t, u in ring if t >= now - _FORECAST_WINDOW_SECONDS]
@@ -326,355 +375,36 @@ def _forecast(ring: deque[tuple[float, int]], free: int, total: int,
     }
 
 
-# --------------------------------------------------------------------- writers
-_WRITERS_PER_MOUNT = 5
-_HELD_PER_MOUNT = 5
-_FILES_PER_MOUNT = 5
-_PATHS_PER_WRITER = 3
-# A process with thousands of descriptors (a database, a proxy) gets its
-# first N looked at; the rest are not worth the syscalls on a slow tick.
-_FDINFO_PER_PROCESS = 512
-_O_ACCMODE, _O_WRONLY, _O_RDWR, _O_APPEND = 0o3, 0o1, 0o2, 0o2000
-
-
-def _fd_offset(pid: int, fd: str) -> tuple[int, str] | None:
-    """(offset, mode) of one descriptor from /proc/<pid>/fdinfo/<fd>, where
-    mode is "w" / "rw" / "r" from the open flags. None when unreadable."""
-    info = linux.read_text(f"/proc/{pid}/fdinfo/{fd}")
-    if not info:
-        return None
-    pos = flags = None
-    for line in info.split("\n"):
-        if line.startswith("pos:"):
-            pos = line[4:].strip()
-        elif line.startswith("flags:"):
-            flags = line[6:].strip()
-        if pos is not None and flags is not None:
-            break
-    if pos is None or flags is None:
-        return None
+def _disk_index(instance: str) -> int | None:
+    head = instance.split(" ", 1)[0]
     try:
-        offset = int(pos)
-        access = int(flags, 8) & _O_ACCMODE
+        return int(head)
     except ValueError:
         return None
-    mode = "w" if access == _O_WRONLY else "rw" if access == _O_RDWR else "r"
-    return offset, mode
 
 
-def _writers(volumes: list[dict], processes: list[dict],
-             every_mount: list[str] | None = None,
-             offsets: dict[tuple[int, str, str], tuple[float, int]] | None = None,
-             now: float | None = None,
-             aliases: dict[str, str] | None = None,
-             ) -> tuple[dict[str, list[dict]], dict[str, list[dict]], int,
-                        dict[str, list[dict]]]:
-    """Which processes are writing to which mount, which *files* they are
-    writing (and how fast), and which deleted files are still held open
-    (the space a rotated log keeps until its holder closes it).
+def _disk_letters(instance: str) -> str:
+    parts = instance.split(" ", 1)
+    return parts[1] if len(parts) > 1 else ""
 
-    All of it comes from /proc/<pid>/fd: readlink names the file, and the
-    descriptor's offset in fdinfo, diffed against the previous tick, is the
-    bytes it advanced per second. That is exact for a sequential writer (a
-    log, a backup, a download) and blind to mmap and pwrite, which move no
-    offset -- so a file with no rate is listed without one, never as 0. The
-    directory is readable for the caller's own processes only unless it has
-    CAP_SYS_PTRACE; the gated count keeps the answer honest. `offsets` is the
-    caller's memory between ticks; without it no rates are computed.
-    `aliases` maps a mount that is another view of a reported volume (a btrfs
-    subvolume, a bind mount) to that volume, so its files count there.
-    """
-    reported = {str(v["mountpoint"]) for v in volumes}
-    if not reported:
-        return {}, {}, 0, {}
-    now = time.time() if now is None else now
-    seen_keys: set[tuple[int, str, str]] = set()
-    # Longest-prefix match over *every* mount (devtmpfs, proc, tmpfs too),
-    # so /dev/null or a tmpfs file is never charged to the root volume
-    # merely because "/" is a prefix of everything.
-    mounts = sorted(set(every_mount or []) | reported | set(aliases or {}), key=len, reverse=True)
 
-    alias = aliases or {}
+def _disk_sort_key(instance: str) -> tuple[int, str]:
+    index = _disk_index(instance)
+    return (index if index is not None else 999, instance)
 
-    def mount_of(path: str) -> str | None:
-        for mount in mounts:
-            if path == mount or path.startswith(mount.rstrip("/") + "/"):
-                if mount in reported:
-                    return mount
-                return alias.get(mount)
+
+def _num(value: float | None, digits: int = 0) -> float | None:
+    if value is None:
         return None
-
-    writers: dict[str, list[dict]] = {}
-    held: dict[str, list[dict]] = {}
-    files: dict[str, list[dict]] = {}
-    gated = 0
-    seen_deleted: set[tuple[int, str]] = set()
-    for proc in processes:
-        if proc.get("is_kthread"):
-            continue
-        try:
-            pid = int(proc.get("pid") or 0)
-        except (TypeError, ValueError):
-            continue
-        rate = float(proc.get("write_bytes_sec") or 0.0)
-        fd_dir = f"/proc/{pid}/fd"
-        try:
-            fds = os.listdir(fd_dir)
-        except OSError:
-            if rate > 0:
-                gated += 1
-            continue
-        # mount -> path -> {deleted, rate, mode}; one entry per path even
-        # when several descriptors point at it (dup'd stdout/stderr).
-        paths: dict[str, dict[str, dict]] = {}
-        looked = 0
-        for fd in fds:
-            try:
-                target = os.readlink(f"{fd_dir}/{fd}")
-            except OSError:
-                continue
-            if not target.startswith("/") or target.startswith("/memfd:"):
-                continue                # sockets, pipes, anon inodes, memfds
-            deleted = target.endswith(" (deleted)")
-            if deleted:
-                target = target[:-len(" (deleted)")]
-            mount = mount_of(target)
-            if mount is None:
-                continue
-            if deleted:
-                key = (pid, target)
-                if key not in seen_deleted:
-                    seen_deleted.add(key)
-                    try:
-                        size = os.stat(f"{fd_dir}/{fd}").st_size
-                    except OSError:
-                        size = None
-                    if size and size >= 1024 ** 2:
-                        held.setdefault(mount, []).append({
-                            "pid": pid, "name": proc.get("name"),
-                            "username": proc.get("username"), "unit": proc.get("unit"),
-                            "container": proc.get("container"),
-                            "path": target, "size": size, "fd": int(fd),
-                        })
-            if rate <= 0:
-                continue
-            entry = paths.setdefault(mount, {}).get(target)
-            if entry is None:
-                entry = paths[mount][target] = {"deleted": deleted, "rate": None, "mode": None}
-            if offsets is None or looked >= _FDINFO_PER_PROCESS:
-                continue
-            looked += 1
-            read = _fd_offset(pid, fd)
-            if read is None:
-                continue
-            offset, mode = read
-            if mode == "r":
-                continue                # a reader: no write rate to claim
-            okey = (pid, fd, target)
-            seen_keys.add(okey)
-            previous = offsets.get(okey)
-            offsets[okey] = (now, offset)
-            if entry["mode"] is None or mode == "w":
-                entry["mode"] = mode
-            if previous is None:
-                continue                # first sight: a rate needs two points
-            then, before = previous
-            if offset < before or now - then <= 0:
-                continue                # rewound (truncate / seek): not a write
-            advanced = (offset - before) / (now - then)
-            entry["rate"] = max(float(entry["rate"] or 0.0), advanced)
-        if rate > 0:
-            cwd_mount = None
-            try:
-                cwd_mount = mount_of(os.readlink(f"/proc/{pid}/cwd"))
-            except OSError:
-                pass
-            targets = set(paths) | ({cwd_mount} if cwd_mount and not paths else set())
-            for mount in targets:
-                ranked = sorted(paths.get(mount, {}).items(),
-                                key=lambda kv: -float(kv[1]["rate"] or 0.0))
-                writers.setdefault(mount, []).append({
-                    "pid": pid, "name": proc.get("name"),
-                    "username": proc.get("username"), "unit": proc.get("unit"),
-                    "container": proc.get("container"),
-                    "write_bytes_sec": rate,
-                    "paths": [{"path": p, "deleted": e["deleted"],
-                               # The offset this file advanced per second;
-                               # None on first sight or for mmap/pwrite IO.
-                               "rate_bytes_sec": (round(e["rate"], 1)
-                                                  if e["rate"] is not None else None),
-                               "mode": e["mode"]}
-                              for p, e in ranked[:_PATHS_PER_WRITER]],
-                    # True when only the working directory pointed here (no
-                    # open file did): a weaker attribution, said as such.
-                    "by_cwd": mount not in paths,
-                })
-                for path, entry in ranked:
-                    if entry["rate"]:
-                        files.setdefault(mount, []).append({
-                            "path": path, "deleted": entry["deleted"],
-                            "rate_bytes_sec": round(entry["rate"], 1),
-                            "mode": entry["mode"], "pid": pid,
-                            "name": proc.get("name"), "unit": proc.get("unit"),
-                            "container": proc.get("container"),
-                        })
-    if offsets is not None:
-        # Forget descriptors that were not seen this tick (closed, or the
-        # process stopped writing), so the map never outgrows the fd table.
-        for key in [k for k in offsets if k not in seen_keys]:
-            del offsets[key]
-    for mount, entries in writers.items():
-        entries.sort(key=lambda e: -float(e["write_bytes_sec"]))
-        del entries[_WRITERS_PER_MOUNT:]
-    for mount, entries in held.items():
-        entries.sort(key=lambda e: -int(e["size"] or 0))
-        del entries[_HELD_PER_MOUNT:]
-    for mount, entries in files.items():
-        entries.sort(key=lambda e: -float(e["rate_bytes_sec"]))
-        del entries[_FILES_PER_MOUNT:]
-    return writers, held, gated, files
+    return round(float(value), digits) if digits else round(float(value))
 
 
-# --------------------------------------------------------------------- helpers
-def _whole_devices() -> dict[str, dict[str, object]]:
-    """Whole block devices (not partitions), minus loop/ram noise.
+def _ms(value: float | None) -> float | None:
+    return None if value is None else round(float(value) * 1000, 2)
 
-    /sys/block only lists whole devices, which is exactly the split needed --
-    partition rows in diskstats double-count everything.
-    """
-    out: dict[str, dict[str, object]] = {}
+
+def _int(value: object) -> int | None:
     try:
-        names = os.listdir("/sys/block")
-    except OSError:
-        return out
-    for name in names:
-        if name.startswith(("loop", "ram", "zram", "sr", "fd")):
-            continue
-        rotational = linux.read_int(f"/sys/block/{name}/queue/rotational")
-        # Layered devices (dm-*, md*) sit on top of real disks; counting both
-        # double-counts every IO in the totals. They stay in the per-disk rows
-        # (their queue depth is real information) but are flagged out of sums.
-        layered = False
-        try:
-            layered = bool(os.listdir(f"/sys/block/{name}/slaves"))
-        except OSError:
-            pass
-        out[name] = {
-            "rotational": bool(rotational) if rotational is not None else None,
-            "layered": layered,
-        }
-    return out
-
-
-_DISKSTAT_FIELDS = (
-    "reads", "reads_merged", "sectors_read", "ms_reading",
-    "writes", "writes_merged", "sectors_written", "ms_writing",
-    "ios_in_progress", "ms_doing_io", "weighted_ms_doing_io",
-)
-
-
-def _read_diskstats(devices: dict[str, dict]) -> dict[str, dict[str, int]]:
-    out: dict[str, dict[str, int]] = {}
-    text = linux.read_text("/proc/diskstats") or ""
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 14:
-            continue
-        name = parts[2]
-        if name not in devices:
-            continue
-        try:
-            values = [int(v) for v in parts[3:3 + len(_DISKSTAT_FIELDS)]]
-        except ValueError:
-            continue
-        out[name] = dict(zip(_DISKSTAT_FIELDS, values))
-    return out
-
-
-def _mounts() -> list[dict[str, str]]:
-    """Parse /proc/self/mountinfo -- unlike /proc/mounts it survives odd mount
-    namespaces and separates the optional fields unambiguously."""
-    out = []
-    text = linux.read_text("/proc/self/mountinfo") or ""
-    for line in text.splitlines():
-        # ... mountpoint options optional... - fstype source superopts
-        left, _, right = line.partition(" - ")
-        left_parts = left.split()
-        right_parts = right.split()
-        if len(left_parts) < 6 or len(right_parts) < 2:
-            continue
-        out.append({
-            "mountpoint": _unescape(left_parts[4]),
-            "options": left_parts[5],
-            "fstype": right_parts[0],
-            "source": right_parts[1],
-        })
-    return out
-
-
-def _unescape(text: str) -> str:
-    """mountinfo escapes space/tab/newline/backslash as octal."""
-    if "\\" not in text:
-        return text
-    for code, char in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"),
-                       ("\\134", "\\")):
-        text = text.replace(code, char)
-    return text
-
-
-def _label_for(source: str) -> str | None:
-    try:
-        for label in os.listdir("/dev/disk/by-label"):
-            target = os.path.realpath(f"/dev/disk/by-label/{label}")
-            if target == os.path.realpath(source):
-                return _unescape(label.replace("\\x20", " "))
-    except OSError:
-        pass
-    return None
-
-
-def _block_media() -> list[dict[str, object]]:
-    """Identity per whole device from lsblk, plus honest health degradation.
-
-    smartctl/nvme-cli give real SMART data but need CAP_SYS_RAWIO or root (and
-    are frequently not installed); their absence is reported as *unknown*,
-    never as healthy.
-    """
-    payload = linux.run_json([
-        "lsblk", "--json", "-d", "-b",
-        "-o", "NAME,TYPE,SIZE,ROTA,MODEL,SERIAL,TRAN,REV,VENDOR",
-    ])
-    out: list[dict[str, object]] = []
-    devices = (payload or {}).get("blockdevices") if isinstance(payload, dict) else None
-    smart_reason = _smart_unavailable_reason()
-    for dev in devices or []:
-        if dev.get("type") != "disk" or str(dev.get("name", "")).startswith(
-                ("loop", "ram", "zram")):
-            continue
-        rota = dev.get("rota")
-        out.append({
-            "index": None,
-            "name": dev.get("name"),
-            "model": (str(dev.get("model") or "").strip()
-                      or str(dev.get("vendor") or "").strip() or None),
-            "interface": dev.get("tran"),
-            "media_type": ("HDD (rotational)" if rota
-                           else "SSD" if rota is False else None),
-            "size": dev.get("size"),
-            "serial": str(dev.get("serial") or "").strip() or None,
-            "firmware": str(dev.get("rev") or "").strip() or None,
-            "status": None,
-            "smart_reason": smart_reason,
-        })
-    return out
-
-
-def _smart_unavailable_reason() -> str | None:
-    import shutil
-
-    if not (shutil.which("smartctl") or shutil.which("nvme")):
-        return ("smartctl / nvme-cli are not installed "
-                "(sudo apt install smartmontools nvme-cli)")
-    if os.geteuid() != 0 and "CAP_SYS_RAWIO" not in linux.capabilities():
-        return "SMART queries need CAP_SYS_RAWIO or root"
-    return None
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None

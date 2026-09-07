@@ -2,97 +2,66 @@
 
 The flight recorder (recorder.py) says *how the machine was doing* when the
 record stops. This module collects what the machine itself wrote down about
-the end: the previous boot's last journal entries, the markers that separate
-a clean shutdown from a hang (the shutdown target reached, logind announcing
-a reboot, the sudo line that asked for it, the power key), the kernel's own
-last words (OOM kills, panics, watchdog lockups, thermal trips, hung tasks),
-what survived in pstore, the packages installed shortly before (a kernel
-upgrade is the most common honest reason for a reboot), and -- when only the
-agent died -- what systemd recorded about the agent's own unit.
+the end -- on Windows, the System event log, which unlike journald survives
+every reboot and needs no privilege for the channels that matter here:
+
+* the shutdown record: USER32 1074 ("The process X has initiated the restart
+  of computer Y on behalf of user Z for the following reason: ...") says
+  who asked and why; Kernel-General 13 and EventLog 6006 prove the shutdown
+  path ran; Kernel-Power 41 and EventLog 6008 say it did not
+* the kernel's own last words: BugCheck 1001 (with the stop code), WHEA
+  hardware errors, disk errors, thermal events, the Resource-Exhaustion
+  Detector's 2004 (virtual memory ran out, and who consumed it)
+* the last System events before the end, slimmed, as the tail
+* minidumps on disk (the pstore analogue), Windows Update installs shortly
+  before (a "kernel package" here is a cumulative update), and -- when only
+  the agent died -- Task Scheduler's record of the agent's own task
 
 Everything is a fact with a time. The verdict is the host's job
-(culprit/coroner.py), because the host also holds the findings and the change
-log it stored before the node went quiet, and because a verdict should be
-one piece of code, not one per agent version.
-
-Access is the usual story: the journal is group-gated and pstore is
-root-only; each source reports its own reason when it cannot be read, and
-the verdict says what could not be checked instead of guessing.
+(culprit/coroner.py); marker kinds keep the Linux names where the meaning
+is the same (`shutdown_target`, `panic`, `mce`, `disk_error`,
+`thermal_critical`, `journal_stopped`) and two Windows-only kinds the host
+learns to read: `shutdown_request` (who asked, and why) and
+`memory_exhaustion` (the commit charge ran out; not a kill).
 """
 
 from __future__ import annotations
 
-import glob
 import logging
-import os
 import re
 import time
 from typing import Any
 
-from .. import linux
+from .. import windows
 from . import events as events_mod
 
 log = logging.getLogger("culprit.forensics")
 
-_TAIL_ENTRIES = 1500          # previous-boot entries scanned for markers
-_KEEP_TAIL = 60               # entries shipped verbatim (slimmed) as "last words"
 _LOOKBACK_S = 1800.0          # how far before the death the scan reaches
+_KEEP_TAIL = 60               # entries shipped verbatim (slimmed) as "last words"
 _PACKAGE_WINDOW_S = 7200.0
+_TAIL_LIMIT = 600
 
-# Targets whose "Reached target" line proves the shutdown path ran: the
-# machine was *told* to go down and got as far as systemd's own end.
-_SHUTDOWN_TARGETS = {
-    "shutdown.target": "shutdown", "reboot.target": "reboot",
-    "poweroff.target": "poweroff", "halt.target": "halt",
-    "kexec.target": "kexec", "final.target": "shutdown",
-}
-
-_TARGET_TEXT = re.compile(
-    r"Reached target (?:System )?(Shutdown|Reboot|Power-?Off|Halt|Kexec|Soft Reboot|"
-    r"Final Step|Late Shutdown Services)\.?$")
-_TARGET_WORDS = {
-    "shutdown": "shutdown", "reboot": "reboot", "power-off": "poweroff",
-    "poweroff": "poweroff", "halt": "halt", "kexec": "kexec", "soft reboot": "reboot",
-    "final step": "shutdown", "late shutdown services": "shutdown",
-}
-
-# (kind, compiled regex) over the rendered MESSAGE. Kernel lines have no
-# MESSAGE_ID, and for the user-space ones the text is the stable part.
-_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("logind_shutdown", re.compile(
-        r"System is (rebooting|powering down|halting|suspending|hibernating)")),
-    ("shutdown_notice", re.compile(
-        r"The system (will|is going down for) (reboot|power off|power-off|halt|shutdown)")),
-    ("power_key", re.compile(r"Power key pressed|Power button pressed")),
-    ("sudo_shutdown", re.compile(
-        r"COMMAND=\S*?(?:/)?(reboot|shutdown|poweroff|halt|init [06]|"
-        r"systemctl (?:--\S+ )?(?:reboot|poweroff|halt|kexec|soft-reboot))")),
-    ("unattended_reboot", re.compile(
-        r"[Uu]nattended-[Uu]pgrade.*(?:[Rr]eboot|[Rr]estart)|needrestart.*reboot|"
-        r"Automatic reboot")),
-    ("oom_kill", re.compile(r"Out of memory: Killed process (\d+) \(([^)]+)\)")),
-    ("oom_unit", re.compile(r"killed by the OOM killer")),
-    ("panic", re.compile(r"Kernel panic|BUG: unable to handle|BUG: kernel NULL pointer|"
-                         r"general protection fault|Oops: ")),
-    ("watchdog", re.compile(r"soft lockup|hard LOCKUP|Watchdog detected|"
-                            r"watchdog did not stop|watchdog: BUG")),
-    ("thermal_critical", re.compile(r"critical temperature reached|Critical temperature|"
-                                    r"thermal.*(shutdown|critical)")),
-    ("hung_task", re.compile(r"blocked for more than \d+ seconds")),
-    ("disk_error", re.compile(
-        r"(blk_update_request: I/O error|Buffer I/O error|critical medium error"
-        r"|EXT4-fs error|XFS .* corruption|nvme.*(timeout|resetting)"
-        r"|ata\d+.*failed command)")),
-    ("mce", re.compile(r"Machine Check Exception|mce: \[Hardware Error")),
-    ("journal_stopped", re.compile(r"^Journal stopped$")),
-    ("suspend", re.compile(r"PM: suspend entry|Entering sleep state")),
+# (provider substring, event ids) -> marker kind. Matched on the System
+# channel; the provider name is the stable identity, the id the subtype.
+_MARKER_SPECS: tuple[tuple[str, tuple[int, ...], str], ...] = (
+    ("USER32", (1074,), "shutdown_request"),
+    ("Microsoft-Windows-Kernel-General", (13,), "shutdown_target"),
+    ("EventLog", (6006,), "journal_stopped"),
+    ("EventLog", (6008,), "unclean"),
+    ("Microsoft-Windows-Kernel-Power", (41,), "unclean"),
+    ("Microsoft-Windows-Kernel-Power", (42,), "suspend"),
+    ("Microsoft-Windows-WER-SystemErrorReporting", (1001,), "panic"),
+    ("Microsoft-Windows-WHEA-Logger", (1, 17, 18, 19, 20, 47), "mce"),
+    ("Microsoft-Windows-Resource-Exhaustion-Detector", (2004,), "memory_exhaustion"),
+    ("Microsoft-Windows-Kernel-Power", (125, 126, 127), "thermal_critical"),
+    ("disk", (7, 11, 51, 129, 153, 157), "disk_error"),
+    ("Ntfs", (55, 98), "disk_error"),
+    ("stornvme", (129,), "disk_error"),
+    ("storahci", (129,), "disk_error"),
 )
-
-# What systemd says about a unit's end, for the agent-died case.
-_UNIT_EXIT = re.compile(r"Main process exited, code=(\w+), status=(\S+)")
-_UNIT_RESULT = re.compile(r"Failed with result '([^']+)'")
-_UNIT_STOPPED = re.compile(r"Deactivated successfully|Stopped ")
-_UNIT_STOPPING = re.compile(r"^Stopping ")
+_TARGET_WORDS = {"restart": "reboot", "reboot": "reboot", "power off": "poweroff",
+                 "shutdown": "poweroff", "shut down": "poweroff"}
 
 
 def investigate(death: dict[str, Any]) -> dict[str, Any]:
@@ -100,257 +69,265 @@ def investigate(death: dict[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
     died_at = float(death.get("died_at") or time.time())
     kind = str(death.get("kind") or "machine")
-    access = linux.journal_access()
-    readable = bool(access.get("readable"))
-    boots = _boots()
-    prev_id = death.get("prev_boot_id")
+    readable = events_mod.AVAILABLE
     evidence: dict[str, Any] = {
-        "journal": {"readable": readable, "reason": access.get("reason"),
-                    "persistent": bool(access.get("persistent"))},
-        "boots": _boot_facts(boots, prev_id, death.get("boot_id")),
-        "markers": [], "tail": [], "pstore": _pstore(),
-        "packages": _packages_before(died_at),
+        "journal": {"readable": readable,
+                    "reason": None if readable else windows.missing("win32evtlog"),
+                    "persistent": True},
+        "boots": {"count": None, "previous": None, "current": None, "gap_seconds": None},
+        "markers": [], "tail": [], "pstore": _minidumps(),
+        "packages": [],
         "agent": None, "notes": [],
+        "platform": "windows",
     }
     if not readable:
         evidence["notes"].append(
-            "The previous boot's journal could not be read, so the shutdown "
-            "path, the kernel's last messages and the agent unit's exit are "
-            f"unverifiable: {access.get('reason')}")
-    elif kind == "machine":
-        if prev_id and not evidence["boots"].get("previous"):
+            "The event log could not be read, so the shutdown record, the "
+            "kernel's last messages and the agent task's exit are unverifiable: "
+            f"{evidence['journal']['reason']}")
+        evidence["cost_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        return evidence
+
+    entries = _system_window(died_at)
+    evidence["boots"] = _boot_facts(entries, died_at, death)
+    evidence["packages"] = _packages_before(died_at)
+    if kind == "machine":
+        evidence["markers"] = _markers(entries, died_at)
+        evidence["tail"] = _slim(entries[:_KEEP_TAIL])
+        if not entries:
             evidence["notes"].append(
-                "The journal has no record of the previous boot (the journal "
-                "is volatile, or was rotated), so only the flight recorder "
-                "says how the machine was doing at the end.")
-        else:
-            entries = _boot_entries(prev_id, died_at)
-            evidence["markers"] = _markers(entries, died_at)
-            evidence["tail"] = _slim(entries[:_KEEP_TAIL])
-            if not entries:
-                evidence["notes"].append(
-                    "No journal entries were found for the previous boot in "
-                    "the half hour before the record stops.")
+                "No System events were found in the half hour before the "
+                "record stops.")
     else:
         evidence["agent"] = _agent_end(death, died_at)
-        entries = _kernel_entries(died_at)
-        evidence["markers"] = _markers(entries, died_at)
+        evidence["markers"] = [m for m in _markers(entries, died_at)
+                               if m["kind"] in ("memory_exhaustion", "mce", "disk_error",
+                                                "thermal_critical", "suspend")]
         evidence["tail"] = _slim(entries[:20])
     evidence["cost_ms"] = round((time.perf_counter() - started) * 1000, 1)
     return evidence
 
 
-# ---------------------------------------------------------------- journal
-def _boots() -> list[dict[str, Any]]:
-    payload = linux.run_json(["journalctl", "--list-boots", "-o", "json", "-q",
-                              "--no-pager"], timeout=20)
-    return payload if isinstance(payload, list) else []
+# ------------------------------------------------------------- event log
+def _spec(channel: str, ids: tuple[int, ...] = (), providers: tuple[str, ...] = (),
+          key: str = "forensics", limit: int = _TAIL_LIMIT) -> events_mod.EventSpec:
+    return events_mod.EventSpec(key=key, label=key, channel=channel, ids=ids,
+                                kind="forensics", providers=providers, limit=limit)
 
 
-def _boot_facts(boots: list[dict[str, Any]], prev_id: Any,
-                current_id: Any) -> dict[str, Any]:
-    def entry(boot: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not boot:
-            return None
-        first = events_mod._to_int(boot.get("first_entry"))
-        last = events_mod._to_int(boot.get("last_entry"))
-        return {"boot_id": _plain_id(boot.get("boot_id")),
-                "first": first / 1e6 if first else None,
-                "last": last / 1e6 if last else None}
-
-    previous = next((b for b in boots if _plain_id(b.get("boot_id")) == _plain_id(prev_id)), None)
-    current = next((b for b in boots if _plain_id(b.get("boot_id")) == _plain_id(current_id)), None)
-    prev_entry, cur_entry = entry(previous), entry(current)
-    gap = None
-    if prev_entry and cur_entry and prev_entry.get("last") and cur_entry.get("first"):
-        gap = round(float(cur_entry["first"]) - float(prev_entry["last"]), 1)
-    return {"count": len(boots), "previous": prev_entry, "current": cur_entry,
-            "gap_seconds": gap}
-
-
-def _plain_id(value: Any) -> str | None:
-    """journalctl shows boot ids without dashes; /proc has them with."""
-    if not value:
-        return None
-    return str(value).replace("-", "").lower()
-
-
-def _boot_entries(boot_id: Any, died_at: float) -> list[dict[str, Any]]:
-    """Newest-first entries of one boot from the half hour before the death."""
-    plain = _plain_id(boot_id)
-    if not plain:
+def _system_window(died_at: float) -> list[dict[str, Any]]:
+    """Newest-first System events from the half hour before the death to a
+    minute after it. The log is not per-boot like the journal, so the window
+    is cut by time and the query asks the log for that window only."""
+    lookback_ms = int(max(0.0, time.time() - (died_at - _LOOKBACK_S)) * 1000)
+    xpath = f"*[System[TimeCreated[timediff(@SystemTime) <= {lookback_ms}]]]"
+    try:
+        raw = events_mod.query_channel(_spec("System"), 1, _TAIL_LIMIT, xpath=xpath)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("forensics query failed: %s", exc)
         return []
-    return linux.journalctl_json(
-        ["-b", plain, "--since", f"@{int(died_at - _LOOKBACK_S)}"],
-        timeout=40, max_entries=_TAIL_ENTRIES)
+    return [e for e in raw if (e.get("timestamp") or 0) <= died_at + 60]
 
 
-def _kernel_entries(died_at: float) -> list[dict[str, Any]]:
-    """Kernel lines around an agent death (same boot): an OOM kill of the
-    agent shows here, not in the unit's own log."""
-    return linux.journalctl_json(
-        ["-k", "--since", f"@{int(died_at - 900)}", "--until", f"@{int(died_at + 60)}"],
-        timeout=20, max_entries=200)
+def _boot_facts(entries: list[dict[str, Any]], died_at: float,
+                death: dict[str, Any]) -> dict[str, Any]:
+    """The previous boot's start and end, and this boot's start, from the
+    EventLog service's 6005 (started) / 6006 (stopped) and Kernel-General 12
+    (boot). The recorder's boot ids are boot times, so they line up."""
+    boots = [e for e in entries if str(e.get("provider") or "") in ("EventLog", "Microsoft-Windows-Kernel-General")
+             and e.get("id") in (6005, 6006, 12, 13)]
+    prev_start = _boot_time_of(death.get("prev_boot_id"))
+    cur_start = _boot_time_of(death.get("boot_id"))
+    last = None
+    for event in boots:
+        ts = float(event.get("timestamp") or 0)
+        if event.get("id") in (6006, 13) and ts <= died_at + 60:
+            last = max(last or 0.0, ts)
+    previous = {"boot_id": death.get("prev_boot_id"), "first": prev_start,
+                "last": last or died_at} if prev_start else None
+    current = {"boot_id": death.get("boot_id"), "first": cur_start,
+               "last": None} if cur_start else None
+    gap = None
+    if previous and current and previous.get("last") and current.get("first"):
+        gap = round(float(current["first"]) - float(previous["last"]), 1)
+    return {"count": None, "previous": previous, "current": current, "gap_seconds": gap}
+
+
+def _boot_time_of(boot_id: Any) -> float | None:
+    """The recorder's boot id is `boot-<epoch>` (windows.boot_id)."""
+    match = re.match(r"^boot-(\d+)$", str(boot_id or ""))
+    return float(match.group(1)) if match else None
+
+
+# The events catalogue's decoders, keyed the way _enrich switches: run on
+# the raw window entries so a bugcheck carries its stop code and the
+# low-memory event its consumers.
+_ENRICH_KEY = {1001: "bugcheck", 2004: "low_memory", 7031: "service_fail", 7034: "service_fail",
+               1: "mce", 17: "mce", 18: "mce", 19: "mce", 20: "mce", 47: "mce"}
 
 
 def _markers(entries: list[dict[str, Any]], died_at: float) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for entry in entries:
-        message = events_mod._first_line(events_mod._msg(entry))
-        ts = events_mod._stamp(entry)
-        # "Reached target X" from either manager: the system manager's own
-        # line is often lost (journald is already stopping by then), but the
-        # user manager's "Reached target Shutdown." lands, and it proves the
-        # same thing -- the machine was told to go down and got that far.
-        unit = str(entry.get("UNIT") or entry.get("USER_UNIT") or "")
-        target_match = _TARGET_TEXT.search(message)
-        if message.startswith("Reached target") and (unit in _SHUTDOWN_TARGETS or target_match):
-            target = _SHUTDOWN_TARGETS.get(unit) or _TARGET_WORDS.get(
-                (target_match.group(1) if target_match else "").lower(), "shutdown")
-            out.append({"kind": "shutdown_target", "ts": ts, "message": message,
-                        "target": target, "who": None,
-                        "manager": "user" if entry.get("USER_UNIT") or
-                        str(entry.get("_SYSTEMD_UNIT") or "").startswith("user@") else "system"})
+        provider = str(entry.get("provider") or "")
+        event_id = entry.get("id")
+        kind = next((k for prov, ids, k in _MARKER_SPECS
+                     if prov.lower() in provider.lower() and event_id in ids), None)
+        if kind is None:
             continue
-        for kind, pattern in _MARKERS:
-            match = pattern.search(message)
-            if not match:
-                continue
-            marker: dict[str, Any] = {"kind": kind, "ts": ts, "message": message[:240],
-                                      "who": None}
-            comm = str(entry.get("_COMM") or entry.get("SYSLOG_IDENTIFIER") or "")
-            if kind == "sudo_shutdown":
-                if comm not in ("sudo", "doas", "pkexec", "su"):
-                    continue    # the word appears in other people's messages too
-                marker["who"] = message.split(" :", 1)[0].strip() or None
-                marker["command"] = match.group(1)
-            elif kind == "logind_shutdown":
-                marker["target"] = {"rebooting": "reboot", "powering down": "poweroff",
-                                    "halting": "halt"}.get(match.group(1), match.group(1))
-                # logind records the user id of the session that asked.
-                marker["who"] = entry.get("USER_ID") or None
-            elif kind == "shutdown_notice":
-                marker["target"] = {"reboot": "reboot", "power off": "poweroff",
-                                    "power-off": "poweroff", "halt": "halt",
-                                    "shutdown": "poweroff"}.get(match.group(2), match.group(2))
-            elif kind == "oom_kill":
-                marker["pid"] = events_mod._to_int(match.group(1))
-                marker["victim"] = match.group(2)
-            elif kind == "oom_unit":
-                marker["unit"] = str(entry.get("UNIT") or entry.get("_SYSTEMD_UNIT") or "")
-            out.append(marker)
-            break
-    # Markers from the whole scan, but only the ones that fall before the
-    # death (plus a minute of slack for clock skew between journal and agent)
-    # can explain it; anything later belongs to the next boot's story.
+        if event_id in _ENRICH_KEY and entry.get("source_key") == "forensics":
+            entry["source_key"] = _ENRICH_KEY[event_id]
+            try:
+                events_mod._enrich(entry)
+            except Exception:  # noqa: BLE001 -- a decoder must never lose the marker
+                pass
+        ts = entry.get("timestamp")
+        message = str(entry.get("title") or entry.get("detail") or provider)
+        data = entry.get("data") or {}
+        positional = data.get("_values") if isinstance(data, dict) else None
+        marker: dict[str, Any] = {"kind": kind, "ts": ts, "message": message[:240], "who": None}
+        if kind == "shutdown_request":
+            # USER32 1074 EventData (positional): process, computer, user,
+            # reason text, reason code, ..., type ("restart" / "power off").
+            values = positional or []
+            process = values[0] if len(values) > 0 else None
+            user = values[6] if len(values) > 6 else (values[2] if len(values) > 2 else None)
+            reason = values[3] if len(values) > 3 else None
+            shutdown_type = (values[4] if len(values) > 4 else "") or ""
+            for word, target in _TARGET_WORDS.items():
+                if word in str(shutdown_type).lower() or word in message.lower():
+                    marker["target"] = target
+                    break
+            marker.setdefault("target", "shutdown")
+            marker["who"] = user or None
+            marker["command"] = str(process or "").rsplit("\\", 1)[-1] or None
+            marker["reason"] = reason or None
+            marker["via"] = ("Windows Update" if any(
+                w in str(process or "").lower() for w in ("wuauclt", "musnotification",
+                                                           "mousocoreworker", "usoclient",
+                                                           "tiworker"))
+                             else None)
+            marker["message"] = (f"{user or 'someone'} asked for a {marker['target']} via "
+                                 f"{marker['command'] or 'an unknown process'}"
+                                 + (f": {reason}" if reason else ""))[:240]
+        elif kind == "shutdown_target":
+            marker["target"] = "shutdown"
+            marker["manager"] = "system"
+        elif kind == "journal_stopped":
+            marker["message"] = "The event log service stopped (clean shutdown path)"
+        elif kind == "panic":
+            bugcheck = entry.get("bugcheck") or {}
+            marker["message"] = (f"BugCheck {bugcheck.get('code')} {bugcheck.get('name')}: "
+                                 f"{bugcheck.get('meaning')}" if bugcheck else message)[:240]
+            marker["stop_code"] = bugcheck.get("code")
+        elif kind == "memory_exhaustion":
+            consumers = ((entry.get("memory") or {}).get("consumers")) or []
+            if consumers:
+                marker["victim"] = consumers[0].get("name")
+                marker["pid"] = consumers[0].get("pid")
+                marker["consumers"] = consumers[:3]
+        out.append(marker)
     out = [m for m in out if m.get("ts") is None or float(m["ts"]) <= died_at + 60]
     out.sort(key=lambda m: -(m.get("ts") or 0))
     return out[:40]
 
 
-def _origin(entry: dict[str, Any]) -> str:
-    if entry.get("_TRANSPORT") == "kernel":
-        return "kernel"
-    return str(entry.get("_SYSTEMD_UNIT") or entry.get("SYSLOG_IDENTIFIER")
-               or entry.get("_COMM") or "?")
-
-
 def _slim(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{
-        "ts": events_mod._stamp(entry),
-        "unit": _origin(entry),
-        "priority": events_mod._to_int(entry.get("PRIORITY")),
-        "message": events_mod._first_line(events_mod._msg(entry))[:240],
+        "ts": entry.get("timestamp"),
+        "origin": entry.get("provider"),
+        "priority": entry.get("level"),
+        "message": str(entry.get("title") or entry.get("detail") or "")[:240],
+        "unit": None,
     } for entry in entries]
 
 
-# -------------------------------------------------------------- agent end
 def _agent_end(death: dict[str, Any], died_at: float) -> dict[str, Any]:
-    """What systemd wrote about the agent's own unit around its end."""
-    unit = linux.unit_from_cgroup(os.getpid())
-    out: dict[str, Any] = {"unit": unit, "events": [], "code": None, "status": None,
+    """What Task Scheduler recorded about the agent's own task around its end.
+    The Operational channel is off by default on client editions; when it is,
+    the note says so and the host's verdict marks the exit unverified."""
+    task = windows.own_service_name()
+    out: dict[str, Any] = {"unit": task, "events": [], "code": None, "status": None,
                            "result": None, "oom": False, "stopped_by_systemd": False,
                            "pid": death.get("agent_pid"), "note": None}
-    if not unit or unit.endswith(".scope"):
-        out["note"] = ("The agent is not running as a systemd service (unit "
-                       f"{unit or 'unknown'}), so systemd kept no record of how "
-                       "its previous run ended.")
+    if not task:
+        out["note"] = ("The agent was not started by its scheduled task (a --run in a "
+                       "console), so nothing recorded how its previous run ended.")
         return out
-    entries = linux.journalctl_json(
-        ["--since", f"@{int(died_at - 900)}", "--until", f"@{int(died_at + 120)}",
-         "-u", unit], timeout=20, max_entries=200)
+    lookback_ms = int(max(0.0, time.time() - (died_at - 900)) * 1000)
+    xpath = (f"*[System[TimeCreated[timediff(@SystemTime) <= {lookback_ms}]]]"
+             f"[EventData[Data[@Name='TaskName']='\\{task}']]")
+    try:
+        entries = events_mod.query_channel(
+            _spec("Microsoft-Windows-TaskScheduler/Operational"), 1, 60, xpath=xpath)
+    except PermissionError:
+        out["note"] = ("Task Scheduler's Operational log needs administrator rights to read.")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        out["note"] = f"Task Scheduler's Operational log could not be read: {windows.short_error(exc)}"
+        return out
     for entry in entries:
-        # Only systemd's own lines about the unit; the agent's stdout is
-        # already in its log and would swamp the few lines that matter.
-        if entry.get("_COMM") not in ("systemd", None) and entry.get("SYSLOG_IDENTIFIER") != "systemd":
+        ts = entry.get("timestamp")
+        if ts and float(ts) > died_at + 120:
             continue
-        message = events_mod._first_line(events_mod._msg(entry))
-        ts = events_mod._stamp(entry)
-        out["events"].append({"ts": ts, "message": message[:240]})
-        match = _UNIT_EXIT.search(message)
-        if match and out["code"] is None:
-            out["code"], out["status"] = match.group(1), match.group(2)
-        match = _UNIT_RESULT.search(message)
-        if match and out["result"] is None:
-            out["result"] = match.group(1)
-        if "OOM" in message or "oom-kill" in message:
-            out["oom"] = True
-        if _UNIT_STOPPING.search(message):
-            out["stopped_by_systemd"] = True
+        event_id = entry.get("id")
+        data = entry.get("data") or {}
+        out["events"].append({"ts": ts, "message": f"Task Scheduler event {event_id}: "
+                              f"{str(entry.get('title') or '')[:200]}"})
+        if event_id == 201 and out["code"] is None:       # action completed
+            code = data.get("ResultCode")
+            out["code"] = "exited"
+            out["status"] = str(code) if code is not None else None
+        elif event_id == 203 and out["code"] is None:     # action failed to start
+            out["code"] = "failed"
+            out["status"] = str(data.get("ResultCode") or "")
+        elif event_id in (102, 111):                      # task completed / terminated
+            out["stopped_by_systemd"] = out["stopped_by_systemd"] or event_id == 111
     out["events"] = out["events"][:20]
     if not out["events"]:
-        out["note"] = (f"systemd logged nothing about {unit} around the end of "
-                       "the previous run.")
+        out["note"] = (f"Task Scheduler logged nothing about {task} around the end of the "
+                       "previous run (its Operational log is off by default: enable it under "
+                       "Task Scheduler > View > Show All Tasks History).")
     return out
 
 
-# ------------------------------------------------------------------ pstore
-def _pstore() -> dict[str, Any]:
-    """Crash output that survives a reboot in firmware-backed storage. The
-    kernel's pstore is root-only; systemd-pstore moves the files into
-    /var/lib/systemd/pstore, which is usually readable."""
-    files: list[dict[str, Any]] = []
-    reason = None
-    for base in ("/sys/fs/pstore", "/var/lib/systemd/pstore"):
-        try:
-            for path in sorted(glob.glob(os.path.join(base, "**", "*"), recursive=True)):
-                if not os.path.isfile(path):
-                    continue
-                stat = os.stat(path)
-                files.append({"path": path, "size": stat.st_size,
-                              "modified": stat.st_mtime})
-        except PermissionError:
-            reason = f"{base} needs root to read"
-        except OSError:
-            continue
-    if not files and reason is None:
-        try:
-            os.listdir("/sys/fs/pstore")
-        except PermissionError:
-            reason = "/sys/fs/pstore needs root to read (systemd-pstore may " \
-                     "have moved its files to /var/lib/systemd/pstore, which is empty)"
-        except OSError:
-            reason = "no pstore on this machine"
-    head = None
-    for entry in sorted(files, key=lambda f: -float(f["modified"])):
-        if "dmesg" in os.path.basename(str(entry["path"])) or "console" in str(entry["path"]):
-            text = linux.read_text(str(entry["path"]))
-            if text:
-                head = text[:2000]
-                entry["read"] = True
-                break
-    return {"files": files[:20], "readable": reason is None, "reason": reason,
-            "head": head}
+# ------------------------------------------------------------------ minidumps
+def _minidumps() -> dict[str, Any]:
+    """Crash dumps on disk play the role pstore does on Linux: a bugcheck
+    leaves a minidump, and a full MEMORY.DMP after a kernel crash."""
+    dumps = events_mod.minidumps()
+    files = [{"path": f.get("path"), "size": f.get("size"), "modified": f.get("modified")}
+             for f in (dumps.get("files") or [])]
+    reason = dumps.get("reason")
+    return {"files": files[:20],
+            "readable": not (reason and "elevation" in str(reason)),
+            "reason": reason, "head": None,
+            "note": "Windows has no pstore; minidumps are the crash output that survives a reboot"}
 
 
 # ---------------------------------------------------------------- packages
 def _packages_before(died_at: float) -> list[dict[str, Any]]:
+    """Windows Update installs shortly before the end: a cumulative update
+    is the usual honest reason for a reboot, the way a kernel package is on
+    Linux."""
     out = []
-    for event in events_mod._apt_history(lookback_days=3, limit=100):
+    lookback_days = max(1.0, (time.time() - (died_at - _PACKAGE_WINDOW_S)) / 86400 + 0.01)
+    try:
+        events = []
+        for spec in events_mod.UPDATE_SPECS:
+            events += events_mod.query_channel(spec, lookback_days, 100)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("update history query failed: %s", exc)
+        return []
+    for event in events:
         ts = float(event.get("timestamp") or 0)
         if died_at - _PACKAGE_WINDOW_S <= ts <= died_at + 60:
             title = str(event.get("title") or "")
             out.append({"ts": ts, "title": title[:200],
-                        "kernel": bool(re.search(r"linux-(image|headers|modules|generic|virtual)|"
-                                                 r"\bkernel\b", title))})
+                        "kernel": bool(re.search(r"cumulative update|feature update|"
+                                                 r"servicing stack", title, re.I))})
+    out.sort(key=lambda p: -p["ts"])
     return out[:10]
+
+
+__all__ = ["investigate"]

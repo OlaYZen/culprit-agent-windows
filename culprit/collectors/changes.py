@@ -326,7 +326,7 @@ class ChangeLog:
                     self._add(ts, "packages", "packages",
                               str(event.get("title") or "Packages changed")[:200],
                               str(event.get("detail") or "") or None,
-                              subject="apt")
+                              subject="windows update")
             self._packages = set(ids)
             if self._sessions is not None:
                 for sid, session in current_sessions.items():

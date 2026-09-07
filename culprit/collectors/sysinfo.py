@@ -1,248 +1,232 @@
-"""Static machine identity: distro, kernel, CPU model, RAM, GPUs, virt state.
+"""Static machine identity: OS build, CPU model, RAM, GPU, domain, boot time.
 
-Collected once at startup and cached (uptime stays live). Everything here is a
-plain file read -- /etc/os-release, DMI sysfs, /proc/cpuinfo -- plus one
-`systemd-detect-virt` call, so the WMI layer this replaces disappears without a
-successor.
+Collected once at startup and cached. Nothing here changes without a reboot or
+a domain-join change, so paying WMI's cost on every tick would be waste.
 
-Includes the privilege map: which optional sources are gated and by exactly
-which group or capability, so the UI can say "add yourself to systemd-journal"
-instead of the Windows-era "run as administrator".
+The payload is the Linux agent's shape plus the Windows facts the original
+build reported (edition, UBR, domain membership). Two keys matter to the
+host beyond display: `platform` says which agent this is (the host picks the
+version feed, the Patch notes mirror and the dashboard's vocabulary by it),
+and `access` names every gated source with the exact thing that unlocks it.
 """
 
 from __future__ import annotations
 
 import getpass
-import json
 import logging
 import os
+import platform
 import socket
 import sys
 import time
 
 import psutil
 
-from .. import linux
+from .. import windows
 from ..util import is_elevated
 
 log = logging.getLogger("culprit.sysinfo")
 
+PLATFORM = "windows"
 
-def _os_release() -> dict[str, str]:
-    out: dict[str, str] = {}
-    text = linux.read_text("/etc/os-release") or ""
-    for line in text.splitlines():
-        key, found, value = line.partition("=")
-        if found:
-            out[key] = value.strip().strip('"')
+# Windows product names are not exposed anywhere cheap, so the caption comes
+# from the registry rather than platform.win32_ver() (which reports "10" for 11).
+_CV_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+
+
+def _registry_os() -> dict[str, object]:
+    out: dict[str, object] = {}
+    values = windows.reg_values(windows.HKLM, _CV_KEY) or {}
+    for name, target in (
+        ("ProductName", "product"),
+        ("DisplayVersion", "display_version"),
+        ("CurrentBuildNumber", "build"),
+        ("UBR", "ubr"),
+        ("EditionID", "edition"),
+        ("InstallationType", "installation_type"),
+        ("InstallDate", "install_date"),
+    ):
+        if values.get(name) is not None:
+            out[target] = str(values[name])
+    # Windows 11 still reports ProductName "Windows 10 ..." on every build.
+    build = str(out.get("build", "0"))
+    try:
+        if int(build) >= 22000 and str(out.get("product", "")).startswith("Windows 10"):
+            out["product"] = str(out["product"]).replace("Windows 10", "Windows 11", 1)
+    except ValueError:
+        pass
+    if not out.get("product"):
+        release = platform.release() or "unknown"
+        out["product"] = f"Windows {release}" if windows.IS_WINDOWS else \
+            f"not Windows ({platform.system()})"
+    if not out.get("build"):
+        out["build"] = platform.version() or None
+    out["build_full"] = (f"{out['build']}.{out['ubr']}" if out.get("ubr")
+                         else out.get("build"))
+    # The Linux fields, absent by construction.
+    out.setdefault("id", "windows")
+    out.setdefault("id_like", None)
+    out.setdefault("codename", None)
     return out
 
 
 def _cpu_identity() -> dict[str, object]:
     info: dict[str, object] = {
-        "logical_cores": os.cpu_count() or 1,
-        "arch": os.uname().machine,
-        "name": "Unknown CPU",
+        "logical_cores": psutil.cpu_count(logical=True),
+        "physical_cores": psutil.cpu_count(logical=False),
+        "arch": platform.machine(),
+        "name": platform.processor() or "Unknown CPU",
+        "vendor": None,
+        "sockets": None,
+        "base_mhz": None,
     }
-    text = linux.read_text("/proc/cpuinfo") or ""
-    packages: set[str] = set()
-    cores: set[tuple[str, str]] = set()
-    package = "0"
-    for line in text.splitlines():
-        key, _, value = line.partition(":")
-        key, value = key.strip(), value.strip()
-        if key == "model name" and info["name"] == "Unknown CPU":
-            info["name"] = value
-        elif key == "vendor_id" and "vendor" not in info:
-            info["vendor"] = value
-        elif key == "physical id":
-            package = value
-            packages.add(value)
-        elif key == "core id":
-            cores.add((package, value))
-    # Topology from cpuinfo can be absent in VMs; fall back to sysfs, then to
-    # "logical == physical" as the last honest guess.
-    if cores:
-        info["physical_cores"] = len(cores)
-        info["sockets"] = max(1, len(packages))
-    else:
-        sysfs_cores: set[tuple[str, str]] = set()
-        base = "/sys/devices/system/cpu"
-        try:
-            for entry in os.listdir(base):
-                if entry.startswith("cpu") and entry[3:].isdigit():
-                    core = linux.read_line(f"{base}/{entry}/topology/core_id")
-                    pkg = linux.read_line(
-                        f"{base}/{entry}/topology/physical_package_id")
-                    if core is not None and pkg is not None:
-                        sysfs_cores.add((pkg, core))
-        except OSError:
-            pass
-        info["physical_cores"] = len(sysfs_cores) or info["logical_cores"]
     try:
         freq = psutil.cpu_freq()
-        if freq and (freq.max or freq.current):
-            info["base_mhz"] = round(freq.max or freq.current)
-    except Exception:  # noqa: BLE001 -- cpufreq can be entirely absent (VMs)
+        if freq:
+            info["base_mhz"] = round(freq.max or freq.current or 0) or None
+    except Exception:  # noqa: BLE001
         pass
+    # PROCESSOR_IDENTIFIER is terse; WMI has the marketing name.
+    rows = windows.wmi_query(
+        "SELECT Name, MaxClockSpeed, NumberOfCores, NumberOfLogicalProcessors, "
+        "L2CacheSize, L3CacheSize, Manufacturer, VirtualizationFirmwareEnabled "
+        "FROM Win32_Processor",
+        ("Name", "MaxClockSpeed", "NumberOfCores", "NumberOfLogicalProcessors",
+         "L2CacheSize", "L3CacheSize", "Manufacturer",
+         "VirtualizationFirmwareEnabled"),
+    )
+    if rows:
+        row = rows[0]
+        if row.get("Name"):
+            info["name"] = str(row["Name"]).strip()
+        for src, dst in (
+            ("MaxClockSpeed", "base_mhz"),
+            ("Manufacturer", "vendor"),
+        ):
+            if row.get(src):
+                info[dst] = row[src]
+        cores = sum(int(r.get("NumberOfCores") or 0) for r in rows)
+        logical = sum(int(r.get("NumberOfLogicalProcessors") or 0) for r in rows)
+        if cores:
+            info["physical_cores"] = cores
+        if logical:
+            info["logical_cores"] = logical
+        for src, dst in (("L2CacheSize", "l2_kb"), ("L3CacheSize", "l3_kb")):
+            if row.get(src):
+                info[dst] = row[src]
+        info["virtualization_firmware"] = bool(row.get("VirtualizationFirmwareEnabled"))
+        info["sockets"] = len(rows)
     return info
 
 
 def _gpu_identity() -> list[dict[str, object]]:
-    """DRM cards by driver name and PCI id. Honest rather than pretty: without
-    a vendor tool there is no marketing name, so the driver is the identity."""
+    rows = windows.wmi_query(
+        "SELECT Name, AdapterRAM, DriverVersion, DriverDate, VideoProcessor, "
+        "CurrentHorizontalResolution, CurrentVerticalResolution, "
+        "CurrentRefreshRate, Status FROM Win32_VideoController",
+        ("Name", "AdapterRAM", "DriverVersion", "DriverDate", "VideoProcessor",
+         "CurrentHorizontalResolution", "CurrentVerticalResolution",
+         "CurrentRefreshRate", "Status"),
+    )
     gpus: list[dict[str, object]] = []
-    base = "/sys/class/drm"
-    try:
-        cards = sorted(c for c in os.listdir(base)
-                       if c.startswith("card") and c[4:].isdigit())
-    except OSError:
-        cards = []
-    for card in cards:
-        device = f"{base}/{card}/device"
-        uevent = linux.parse_kv_file(f"{device}/uevent", sep="=")
-        driver = uevent.get("DRIVER") or "unknown driver"
-        vendor_id = (linux.read_line(f"{device}/vendor") or "").removeprefix("0x")
-        device_id = (linux.read_line(f"{device}/device") or "").removeprefix("0x")
-        vendor = {"10de": "NVIDIA", "1002": "AMD", "8086": "Intel",
-                  "1234": "QEMU", "15ad": "VMware", "1af4": "virtio"}.get(
-            vendor_id, vendor_id or "?")
+    for row in rows:
+        ram = row.get("AdapterRAM")
+        # Win32_VideoController.AdapterRAM is a uint32 and wraps above 4 GB, so
+        # it is a hint about the adapter, never a VRAM budget. Real numbers come
+        # from the GPU Adapter Memory performance counters.
+        try:
+            ram = int(ram) if ram is not None else None
+        except (TypeError, ValueError):
+            ram = None
+        width = row.get("CurrentHorizontalResolution")
+        height = row.get("CurrentVerticalResolution")
+        name = str(row.get("Name") or "Unknown GPU").strip()
         gpus.append({
-            "name": f"{vendor} GPU ({driver}, {vendor_id}:{device_id})",
-            "driver": driver,
-            "card": card,
-            "integrated": driver in ("i915", "xe", "amdgpu") and vendor == "Intel",
+            "name": name,
+            "driver": row.get("VideoProcessor"),
+            "card": None,
+            "adapter_ram": ram,
+            "driver_version": row.get("DriverVersion"),
+            "driver_date": windows.wmi_date(row.get("DriverDate")),
+            "video_processor": row.get("VideoProcessor"),
+            "resolution": f"{width}x{height}" if width and height else None,
+            "refresh_hz": row.get("CurrentRefreshRate"),
+            "status": row.get("Status"),
+            "integrated": _looks_integrated(name),
         })
     return gpus
 
 
-def _dmi() -> dict[str, object]:
-    dmi = "/sys/class/dmi/id"
+def _looks_integrated(name: str) -> bool:
+    lowered = name.lower()
+    return any(
+        token in lowered
+        for token in ("iris", "uhd graphics", "hd graphics", "vega", "radeon graphics",
+                      "microsoft basic", "arc(tm) graphics", "radeon(tm) graphics")
+    )
+
+
+def _machine() -> dict[str, object]:
+    rows = windows.wmi_query(
+        "SELECT Name, Domain, Workgroup, PartOfDomain, Manufacturer, Model, "
+        "TotalPhysicalMemory, SystemType, DomainRole, NumberOfProcessors, "
+        "HypervisorPresent FROM Win32_ComputerSystem",
+        ("Name", "Domain", "Workgroup", "PartOfDomain", "Manufacturer", "Model",
+         "TotalPhysicalMemory", "SystemType", "DomainRole", "NumberOfProcessors",
+         "HypervisorPresent"),
+    )
     info: dict[str, object] = {
-        "manufacturer": linux.read_line(f"{dmi}/sys_vendor"),
-        "model": linux.read_line(f"{dmi}/product_name"),
-        "board": linux.read_line(f"{dmi}/board_name"),
-        "bios_version": linux.read_line(f"{dmi}/bios_version"),
-        "bios_date": linux.read_line(f"{dmi}/bios_date"),
-        "part_of_domain": False,  # kept for payload compatibility; no AD here
+        "manufacturer": None, "model": None, "board": None,
+        "bios_version": None, "bios_date": None, "part_of_domain": False,
+        "serial": None, "serial_reason": None,
+        "computer_name": None, "domain": None, "workgroup": None,
+        "system_type": None, "hypervisor_present": None,
     }
-    # Serials are root-gated on purpose; say so instead of showing blank.
-    serial = linux.read_line(f"{dmi}/product_serial")
-    info["serial"] = serial
-    if serial is None and os.geteuid() != 0:
-        info["serial_reason"] = "DMI serial numbers need root"
+    if rows:
+        row = rows[0]
+        info.update({
+            "computer_name": row.get("Name"),
+            "domain": row.get("Domain"),
+            "workgroup": row.get("Workgroup"),
+            "part_of_domain": bool(row.get("PartOfDomain")),
+            "manufacturer": row.get("Manufacturer"),
+            "model": row.get("Model"),
+            "system_type": row.get("SystemType"),
+            "hypervisor_present": (bool(row["HypervisorPresent"])
+                                   if row.get("HypervisorPresent") is not None else None),
+        })
+    bios = windows.wmi_query(
+        "SELECT SerialNumber, SMBIOSBIOSVersion, ReleaseDate, Manufacturer FROM Win32_BIOS",
+        ("SerialNumber", "SMBIOSBIOSVersion", "ReleaseDate", "Manufacturer"),
+    )
+    if bios:
+        info["bios_version"] = bios[0].get("SMBIOSBIOSVersion")
+        info["bios_date"] = windows.wmi_date(bios[0].get("ReleaseDate"))
+        info["serial"] = str(bios[0].get("SerialNumber") or "").strip() or None
+    board = windows.wmi_query("SELECT Product, Manufacturer FROM Win32_BaseBoard",
+                              ("Product", "Manufacturer"))
+    if board:
+        info["board"] = board[0].get("Product")
+    if not rows and not bios:
+        info["serial_reason"] = windows.wmi_reason()
     return info
 
 
-def _access_map() -> dict[str, object]:
-    """Which gated sources are available, and what would unlock the rest.
-
-    This is the Linux replacement for the single Windows elevated/not-elevated
-    bit: privilege here is granular, so every gate names its exact key.
-    """
-    journal = linux.journal_access()
-    caps = linux.capabilities()
-    return {
-        "root": os.geteuid() == 0,
-        "groups": journal.get("groups"),
-        "capabilities": sorted(caps),
-        "journal": {"ok": journal.get("readable"),
-                    "needs": None if journal.get("readable")
-                    else "systemd-journal (or adm) group membership"},
-        "process_io": {"ok": os.geteuid() == 0 or "CAP_SYS_PTRACE" in caps,
-                       "needs": "CAP_SYS_PTRACE for other users' "
-                                "/proc/<pid>/io and fd counts",
-                       "ptrace_scope": linux.ptrace_scope()},
-        "smart": {"ok": os.geteuid() == 0 or "CAP_SYS_RAWIO" in caps,
-                  "needs": "CAP_SYS_RAWIO or root for SMART health"},
-        "dmi_serial": {"ok": os.geteuid() == 0, "needs": "root"},
-        "btmp": {"ok": os.access("/var/log/btmp", os.R_OK),
-                 "needs": "root (or utmp group) for failed-login records"},
-        "gpu_perf": {"ok": "CAP_PERFMON" in caps or os.geteuid() == 0,
-                     "needs": "CAP_PERFMON or relaxed perf_event_paranoid "
-                              "for i915 PMU counters"},
-    }
-
-
-_PRO_DIR = "/var/lib/ubuntu-advantage"
-_PRO_STATUS = f"{_PRO_DIR}/status.json"
-
-
-def _pro_expiry(raw: object) -> tuple[float | None, bool]:
-    """(epoch seconds, perpetual). A free personal token encodes 'no expiry'
-    as the year 9999, which we surface as perpetual rather than a silly date."""
-    if not raw:
-        return None, False
-    text = str(raw)
-    if text.startswith("9999"):
-        return None, True
-    try:
-        import datetime
-        return datetime.datetime.fromisoformat(
-            text.replace("Z", "+00:00")).timestamp(), False
-    except (ValueError, TypeError):
-        return None, False
-
-
-def _ubuntu_pro(release: dict[str, str]) -> dict[str, object] | None:
-    """Ubuntu Pro subscription state, or None on non-Ubuntu (so the UI omits it).
-
-    Read from the pro client's world-readable cache
-    (`/var/lib/ubuntu-advantage/status.json`), never `pro status` -- that
-    contacts contracts.canonical.com and measured ~5s here, unacceptable for a
-    background sampler. The cache is refreshed by the client's own timer; a
-    stale-but-instant read is the right trade. The account email is deliberately
-    not surfaced.
-    """
-    if (release.get("ID") or "").lower() != "ubuntu":
-        return None
-    if not os.path.exists(_PRO_DIR):
-        return {"available": False, "attached": False,
-                "reason": "Ubuntu Pro client (ubuntu-pro-client) is not installed"}
-    text = linux.read_text(_PRO_STATUS)
-    if text is None:
-        return {"available": False, "attached": False,
-                "reason": "pro status cache is absent or unreadable "
-                          "(/var/lib/ubuntu-advantage/status.json)"}
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return {"available": False, "attached": False,
-                "reason": "pro status cache is not valid JSON"}
-
-    attached = bool(data.get("attached"))
-    enabled: list[str] = []
-    services: list[dict[str, object]] = []
-    for svc in data.get("services") or []:
-        name = svc.get("name")
-        if not name:
-            continue
-        status = svc.get("status")            # enabled | disabled | n/a | ...
-        entitled = svc.get("entitled")        # yes | no
-        if status == "enabled":
-            enabled.append(name)
-        # Only the services worth showing: entitled here or currently on. The
-        # long tail of n/a-on-this-hardware entries is noise.
-        if entitled == "yes" or status == "enabled":
-            services.append({
-                "name": name,
-                "description": svc.get("description"),
-                "status": status,
-                "entitled": entitled,
-                "available": svc.get("available"),
-            })
-
-    expires_epoch, perpetual = _pro_expiry(data.get("expires"))
-    return {
-        "available": True,
-        "attached": attached,
-        "origin": data.get("origin"),         # "free" | "contract" | ...
-        "expires_epoch": expires_epoch,
-        "perpetual": perpetual,
-        "enabled": enabled,
-        "services": services,
-        "reason": None if attached else "this machine is not attached to Ubuntu Pro",
-    }
+def _virtualization(machine: dict[str, object]) -> str | None:
+    """What hypervisor this is a guest of, from the model string the
+    firmware reports -- the Windows counterpart of systemd-detect-virt."""
+    model = str(machine.get("model") or "").lower()
+    manufacturer = str(machine.get("manufacturer") or "").lower()
+    blob = f"{manufacturer} {model}"
+    for hint, name in (("virtual machine", "hyperv"), ("vmware", "vmware"),
+                       ("virtualbox", "oracle"), ("kvm", "kvm"), ("qemu", "qemu"),
+                       ("xen", "xen"), ("parallels", "parallels"),
+                       ("amazon ec2", "amazon"), ("google compute", "google")):
+        if hint in blob:
+            return name
+    if machine.get("hypervisor_present") and "microsoft corporation" in manufacturer:
+        return "hyperv"
+    return None
 
 
 _cache: dict[str, object] | None = None
@@ -255,45 +239,33 @@ def collect(force: bool = False) -> dict[str, object]:
         _cache["uptime_seconds"] = time.time() - float(_cache["boot_time"])  # type: ignore[arg-type]
         return _cache
 
-    release = _os_release()
-    uname = os.uname()
     boot = psutil.boot_time()
-    virt = (linux.run(["systemd-detect-virt"], timeout=3) or "").strip() or None
-    if virt == "none":
-        virt = None
-    container = linux.in_container()
-
+    total_ram = psutil.virtual_memory().total
+    machine = _machine()
     payload: dict[str, object] = {
+        "platform": PLATFORM,
         "hostname": socket.gethostname(),
         "fqdn": _fqdn(),
         "user": getpass.getuser(),
-        "user_domain": None,
+        "user_domain": os.environ.get("USERDOMAIN"),
         "elevated": is_elevated(),
-        "os": {
-            "product": release.get("PRETTY_NAME") or release.get("NAME")
-            or "Linux",
-            "display_version": release.get("VERSION_ID"),
-            "id": release.get("ID"),
-            "id_like": release.get("ID_LIKE"),
-            "codename": release.get("VERSION_CODENAME"),
-            # The kernel release plays the role the Windows build number did.
-            "build": uname.release,
-            "build_full": uname.release,
-        },
-        "kernel": f"{uname.sysname} {uname.release} {uname.version}",
-        "machine_id": linux.read_line("/etc/machine-id"),
+        "os": _registry_os(),
+        "kernel": f"Windows NT {platform.version()}" if windows.IS_WINDOWS
+                  else f"{platform.system()} {platform.release()}",
+        "machine_id": windows.reg_value(windows.HKLM, r"SOFTWARE\Microsoft\Cryptography",
+                                        "MachineGuid"),
         "cpu": _cpu_identity(),
         "gpus": _gpu_identity(),
-        "machine": _dmi(),
-        "virtualization": virt,
-        "container": container,
-        "container_warning": (
-            f"running in a {container} container: /proc-derived numbers are "
-            "the host's unless lxcfs is mounted" if container else None),
-        "cgroup_version": linux.cgroup_version(),
-        "psi_available": linux.psi_available(),
-        "access": _access_map(),
-        "total_ram": psutil.virtual_memory().total,
+        "machine": machine,
+        "virtualization": _virtualization(machine),
+        "container": None,
+        "container_warning": None,
+        "cgroup_version": None,
+        "psi_available": False,
+        "psi_reason": windows.not_capable("PSI is a Linux kernel interface; "
+                                          "pressure is derived from counters"),
+        "access": windows.access_map(),
+        "total_ram": total_ram,
         "boot_time": boot,
         "uptime_seconds": time.time() - boot,
         "python": sys.version.split()[0],
@@ -302,11 +274,6 @@ def collect(force: bool = False) -> dict[str, object]:
         "utc_offset_minutes": -time.timezone // 60 if not time.daylight
                               else -time.altzone // 60,
     }
-    # Ubuntu Pro only exists on Ubuntu; the key is omitted entirely elsewhere so
-    # the dashboard never shows it on a non-Ubuntu machine.
-    pro = _ubuntu_pro(release)
-    if pro is not None:
-        payload["ubuntu_pro"] = pro
     _cache = payload
     return payload
 

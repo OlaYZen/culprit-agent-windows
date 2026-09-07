@@ -1,21 +1,27 @@
-"""Network throughput, interfaces, sockets and connectivity health.
+"""Network throughput, adapters, sockets and connectivity health.
 
-Two collectors again: per-interface byte counters are cheap enough for the fast
-tick, while interface configuration, the socket table and reachability probes
-run on the slow tick.
+Two collectors again: per-adapter byte counters are cheap enough for the fast
+tick, while adapter configuration, the socket table and reachability probes
+are not and run on the slow tick.
 
-Interface config comes from /sys/class/net plus `ip -json route` and
-systemd-resolved (falling back to /etc/resolv.conf) -- no daemon dependency.
-Sockets come from psutil (which reads /proc/net/*): measured at ~3ms for this
-machine's table, so the netlink sock_diag upgrade the porting notes suggest
-was not worth a hand-rolled netlink client here; PID attribution would still
-be fd-scanning either way. Sockets owned by other users list with pid=null
-and the payload says how many.
+Adapter configuration comes from WMI (Win32_NetworkAdapterConfiguration) and
+the route table (Win32_IP4RouteTable for the default route); sockets from
+psutil, which on Windows reads the extended TCP/UDP tables that carry the
+owning PID for every socket without elevation -- the one place Windows is
+*more* forthcoming than Linux, where other users' sockets go unattributed.
+What Windows does not hand out is per-connection TCP state: RTT, retransmits
+and byte counters live behind GetPerTcpConnectionEStats, which needs the
+connection to have been opted in and administrator rights, so `tcp_info` is
+honestly False and the per-process view sums connection counts only.
 
-Reachability keeps the Windows build's hardest-won lesson verbatim: probe with
-TCP (not ICMP), try several ports, run them concurrently, and report a silent
-host as **"filtered", not "down"** -- managed gateways routinely drop
-everything they are not obliged to answer.
+Reachability uses a TCP connect rather than ICMP: raw sockets need elevation,
+and `ping.exe` costs a process spawn per target. A TCP handshake against the
+gateway/DNS resolver answers "is the network actually usable" more honestly
+anyway, since plenty of corporate networks drop ICMP -- and a silent host is
+reported as **filtered, not down**.
+
+The WAN-IP lookup and the VPN-provider recognition are the Linux agent's,
+verbatim: they are HTTP and string matching, nothing platform-specific.
 """
 
 from __future__ import annotations
@@ -23,53 +29,55 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
-import shutil
 import socket
-import struct
-import subprocess
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psutil
 
-from .. import linux
+from .. import windows
 from ..util import rate
 
 log = logging.getLogger("culprit.network")
 
-# Interface name prefixes -> kind. Predictable-naming prefixes (en*, wl*) plus
-# the classic ones; VPN and container plumbing by the names their drivers use.
-_KIND_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("lo",), "loopback"),
-    (("wg", "tun", "tap", "ppp", "tailscale", "zt", "nordlynx", "proton"), "vpn"),
-    (("docker", "veth", "br-", "virbr", "lxc", "lxd", "cni", "flannel",
-      "kube", "vnet"), "virtual"),
-    (("wl",), "wifi"),
-    (("en", "eth", "em", "eno", "ens", "enp"), "ethernet"),
-    (("ww",), "cellular"),
-    (("bond", "team"), "bond"),
+# Interfaces that exist on every Windows box and only add noise.
+_BORING = ("loopback pseudo-interface", "isatap", "teredo")
+
+_VPN_HINTS = (
+    "vpn", "anyconnect", "globalprotect", "forticlient", "pulse", "wireguard",
+    "openvpn", "tap-windows", "zscaler", "netmotion", "tailscale", "zerotier",
+    "checkpoint", "sonicwall", "ipsec", "juniper", "sophos", "nordlynx",
+    "proton", "mullvad", "surfshark",
 )
+
+_VIRTUAL_HINTS = ("hyper-v", "vethernet", "vmware", "virtualbox", "wsl", "docker",
+                  "bluetooth", "npcap", "microsoft kernel debug", "wan miniport")
 
 
 def _classify(name: str) -> str:
     lowered = name.lower()
-    for prefixes, kind in _KIND_PREFIXES:
-        if lowered.startswith(prefixes):
-            return kind
-    # /sys uevent DEVTYPE catches renamed wifi/bridge interfaces.
-    devtype = linux.parse_kv_file(f"/sys/class/net/{name}/uevent", sep="=").get(
-        "DEVTYPE")
-    if devtype == "wlan":
-        return "wifi"
-    if devtype in ("bridge", "vlan"):
+    if any(hint in lowered for hint in _VPN_HINTS):
+        return "vpn"
+    if any(hint in lowered for hint in _VIRTUAL_HINTS):
         return "virtual"
-    if devtype == "wwan":
+    if "wi-fi" in lowered or "wireless" in lowered or "wlan" in lowered or "802.11" in lowered:
+        return "wifi"
+    if "ethernet" in lowered or "gbe" in lowered or "gigabit" in lowered or "realtek pcie" in lowered:
+        return "ethernet"
+    if "loopback" in lowered:
+        return "loopback"
+    if "cellular" in lowered or "mobile broadband" in lowered or "wwan" in lowered:
         return "cellular"
     return "other"
 
 
-# VPN interface name -> the software behind it, so the UI can say *which* VPN.
+def _is_boring(name: str) -> bool:
+    lowered = name.lower()
+    return any(token in lowered for token in _BORING)
+
+
+
 _VPN_TYPES: tuple[tuple[str, str], ...] = (
     ("nordlynx", "NordVPN"), ("proton", "ProtonVPN"), ("tailscale", "Tailscale"),
     ("wg", "WireGuard"), ("zt", "ZeroTier"), ("tun", "OpenVPN"),
@@ -89,8 +97,12 @@ def _vpn_type(name: str) -> str:
 # and plain HTTP sidesteps CA-trust differences across minimal container images.
 # ip-api additionally names the IP's owner and flags known proxy/VPN exits,
 # which is how an upstream (router-level) VPN with no local interface is caught.
+
+
 _WAN_INFO_URL = ("http://ip-api.com/json/?fields=status,query,isp,org,as,"
                  "proxy,hosting")
+
+
 _WAN_ENDPOINTS = (
     "http://checkip.amazonaws.com",
     "http://ifconfig.me/ip",
@@ -100,6 +112,8 @@ _WAN_ENDPOINTS = (
 # Substrings that mark a WAN exit IP as a VPN provider's, from the IP's org/ISP/
 # ASN. A plain datacenter IP is "hosting" but NOT a VPN, so the hosting flag is
 # deliberately never used as a signal on its own -- only proxy or a name match.
+
+
 _VPN_PROVIDER_HINTS = (
     "mullvad", "31173 services", "nordvpn", "nord vpn", "protonvpn",
     "proton vpn", "proton ag", "expressvpn", "express vpn", "surfshark",
@@ -168,10 +182,12 @@ def _wan_ip() -> dict[str, object]:
 
 
 class NetworkRateCollector:
-    """Fast-tick per-interface throughput."""
+    """Fast-tick per-adapter throughput."""
 
-    # Link speed and MTU change only on reconfiguration; net_if_stats() is the
-    # expensive half of this collector, so it refreshes on a slow TTL.
+    # Link speed, MTU and duplex change only when an adapter is reconfigured,
+    # but `net_if_stats()` is the expensive half of this collector -- together
+    # with the byte counters it cost ~98ms on every 1-second tick. Refreshing it
+    # every 10s instead brings the fast tick down to ~30ms.
     _STATS_TTL = 10.0
 
     def __init__(self) -> None:
@@ -190,7 +206,8 @@ class NetworkRateCollector:
         try:
             current = psutil.net_io_counters(pernic=True)
         except Exception as exc:  # noqa: BLE001
-            return {"available": False, "reason": str(exc), "interfaces": []}
+            return {"available": False, "reason": str(exc), "interfaces": [],
+                    "total": {"sent_bytes_sec": None, "recv_bytes_sec": None}}
 
         if moment - self._stats_at > self._STATS_TTL:
             try:
@@ -203,6 +220,8 @@ class NetworkRateCollector:
         interfaces = []
         total_sent = total_recv = 0.0
         for name, counters in current.items():
+            if _is_boring(name):
+                continue
             kind = _classify(name)
             if kind == "loopback":
                 continue
@@ -213,8 +232,8 @@ class NetworkRateCollector:
                              getattr(previous, "bytes_recv", None), elapsed)
             stat = stats.get(name)
             is_up = bool(getattr(stat, "isup", False))
-            # A down interface with zero traffic is clutter; one that was just
-            # carrying traffic is a symptom, so recently active ones stay.
+            # A down adapter with zero traffic is clutter; a down adapter that
+            # was just carrying traffic is a symptom, so keep recently active ones.
             if not is_up and sent_rate == 0 and recv_rate == 0 and counters.bytes_recv == 0:
                 continue
             total_sent += sent_rate
@@ -223,7 +242,7 @@ class NetworkRateCollector:
             interfaces.append({
                 "name": name,
                 "up": is_up,
-                "operstate": linux.read_line(f"/sys/class/net/{name}/operstate"),
+                "operstate": "up" if is_up else "down",
                 "speed_mbps": speed if speed and speed > 0 else None,
                 "mtu": getattr(stat, "mtu", None),
                 "duplex": _duplex(getattr(stat, "duplex", 0)),
@@ -254,7 +273,7 @@ class NetworkRateCollector:
 
 
 class NetworkDetailCollector:
-    """Slow-tick interface config, socket table and connectivity probes."""
+    """Slow-tick adapter config, socket table and connectivity probes."""
 
     def __init__(self) -> None:
         self._config: list[dict[str, object]] | None = None
@@ -263,21 +282,18 @@ class NetworkDetailCollector:
         self._probe_at = 0.0
         self._wan: dict[str, object] | None = None
         self._wan_at = 0.0
-        # (local, peer) -> (monotonic, bytes_sent, bytes_received) of the last
-        # tick, so each established connection carries a byte rate.
-        self._conn_prev: dict[tuple[str, str], tuple[float, int, int]] = {}
 
     def sample(self, processes: list[dict] | None = None) -> dict[str, object]:
-        """`processes` (the latest process table) names the process and unit
-        behind each connection, so the Map can say nginx, not pid 4242."""
+        """`processes` (the latest process table) names the process behind
+        each connection, so the Map can say chrome.exe, not pid 4242."""
         now = time.monotonic()
-        # Config changes on VPN connect/disconnect and DHCP renewal, so it
-        # refreshes every 60s rather than caching for the process lifetime.
+        # Adapter config changes on VPN connect/disconnect and DHCP renewal, so
+        # refresh it every 60s rather than caching for the process lifetime.
         if self._config is None or now - self._config_at > 60:
             self._config = _adapter_config()
             self._config_at = now
 
-        sockets = _socket_table(processes or [], self._conn_prev, now)
+        sockets = _socket_table(processes or [])
 
         if now - self._probe_at > 30:
             self._probe_cache = _connectivity(self._config or [])
@@ -293,11 +309,6 @@ class NetworkDetailCollector:
             adapter for adapter in (self._config or [])
             if adapter.get("kind") == "vpn" and adapter.get("ip_addresses")
         ]
-
-        # Second signal: the exit IP itself. An upstream/router VPN leaves no
-        # local interface, so it is only visible as a WAN IP owned by a VPN
-        # provider (name match) or flagged as a proxy/VPN exit. "hosting" alone
-        # is never used -- a plain VPS is hosting but not a VPN.
         wan = self._wan or {}
         provider = _vpn_provider(wan.get("org"), wan.get("isp"), wan.get("asn"))
         via_exit_ip = bool(wan.get("proxy")) or provider is not None
@@ -310,12 +321,8 @@ class NetworkDetailCollector:
             "wan_ip": self._wan,
             "vpn": {
                 "active": bool(vpn_active) or via_exit_ip,
-                # A VPN interface carrying the default route -- or an exit IP that
-                # is itself the VPN's -- means all traffic leaves via the VPN.
                 "full_tunnel": (any(a.get("default_route") for a in vpn_active)
                                 or via_exit_ip),
-                # Detected purely from the exit IP (no local VPN interface) --
-                # i.e. the VPN runs upstream, on the router.
                 "via_exit_ip": via_exit_ip,
                 "exit_provider": exit_provider,
                 "interfaces": [
@@ -331,150 +338,86 @@ class NetworkDetailCollector:
 
 
 def _adapter_config() -> list[dict[str, object]]:
-    """IP / gateway / DNS per interface from psutil, ip(8) and resolved."""
-    try:
-        addrs = psutil.net_if_addrs()
-    except Exception:  # noqa: BLE001
-        addrs = {}
-
-    routes = linux.run_json(["ip", "-json", "route", "show", "default"],
-                            timeout=5)
-    gateway_by_dev: dict[str, list[str]] = {}
-    default_devs: set[str] = set()
-    for route in routes if isinstance(routes, list) else []:
-        dev = route.get("dev")
-        if not dev:
-            continue
-        # A full-tunnel VPN default route may have no gateway (point-to-point),
-        # so track the device separately from the gateway.
-        default_devs.add(dev)
-        gw = route.get("gateway")
-        if gw:
-            gateway_by_dev.setdefault(dev, []).append(str(gw))
-
-    dns_servers, dns_domain, dns_source = _dns_config()
-
+    """IP/DNS/gateway/DHCP per adapter, from WMI, plus which adapter carries
+    the default route (Win32_IP4RouteTable destination 0.0.0.0)."""
     out: list[dict[str, object]] = []
-    for name, entries in addrs.items():
-        kind = _classify(name)
-        if kind == "loopback":
+    default_ifaces: set[int] = set()
+    for route in windows.wmi_query(
+            "SELECT InterfaceIndex, Metric1 FROM Win32_IP4RouteTable "
+            "WHERE Destination = '0.0.0.0'", ("InterfaceIndex", "Metric1")):
+        try:
+            default_ifaces.add(int(route.get("InterfaceIndex")))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
             continue
-        ips, subnets, mac = [], [], None
-        for entry in entries:
-            family = getattr(entry.family, "name", str(entry.family))
-            if family in ("AF_INET", "AF_INET6"):
-                address = entry.address.split("%")[0]
-                ips.append(address)
-                if entry.netmask:
-                    subnets.append(entry.netmask)
-            elif family in ("AF_LINK", "AF_PACKET"):
-                mac = entry.address
-        gateways = gateway_by_dev.get(name, [])
+    for cfg in windows.wmi_query(
+        "SELECT Description, IPAddress, IPSubnet, DefaultIPGateway, "
+        "DNSServerSearchOrder, DHCPEnabled, DHCPServer, MACAddress, "
+        "DNSDomain, InterfaceIndex "
+        "FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = True",
+        ("Description", "IPAddress", "IPSubnet", "DefaultIPGateway",
+         "DNSServerSearchOrder", "DHCPEnabled", "DHCPServer", "MACAddress",
+         "DNSDomain", "InterfaceIndex"),
+    ):
+        description = str(cfg.get("Description") or "")
+        try:
+            index: int | None = int(cfg.get("InterfaceIndex"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            index = None
+        gateways = _tuple(cfg.get("DefaultIPGateway"))
         out.append({
-            "description": name,
-            "kind": kind,
-            "ip_addresses": ips,
-            "subnets": subnets,
+            "description": description,
+            "kind": _classify(description),
+            "ip_addresses": _tuple(cfg.get("IPAddress")),
+            "subnets": _tuple(cfg.get("IPSubnet")),
             "gateways": gateways,
-            "default_route": name in default_devs,
-            # DNS on Linux is system-wide (resolved/resolv.conf), not
-            # per-adapter; every row shows the same resolver set and its
-            # provenance rather than pretending per-NIC DNS exists.
-            "dns_servers": dns_servers,
-            "dns_domain": dns_domain,
-            "dns_source": dns_source,
-            "dhcp": None,  # not knowable generically without the DHCP client's state
-            "dhcp_server": None,
-            "mac": mac,
-            "operstate": linux.read_line(f"/sys/class/net/{name}/operstate"),
+            "default_route": (index in default_ifaces) if default_ifaces else bool(gateways),
+            "dns_servers": _tuple(cfg.get("DNSServerSearchOrder")),
+            "dns_domain": cfg.get("DNSDomain"),
+            "dns_source": "adapter configuration (WMI)",
+            "dhcp": bool(cfg.get("DHCPEnabled")),
+            "dhcp_server": cfg.get("DHCPServer"),
+            "mac": cfg.get("MACAddress"),
+            "operstate": "up",
+            "interface_index": index,
         })
-    # Interfaces with a default route first -- they are the ones that matter.
-    out.sort(key=lambda a: (0 if a["gateways"] else 1, str(a["description"])))
+    if not out and not windows.IS_WINDOWS:
+        log.debug("adapter config: %s", windows.wmi_reason())
     return out
 
 
-def _dns_config() -> tuple[list[str], str | None, str]:
-    """Resolver list, preferring the real upstreams from systemd-resolved.
-
-    /etc/resolv.conf frequently just says 127.0.0.53 (the resolved stub),
-    which is true but useless for "is my DNS server reachable".
-    """
-    # `resolvectl dns` output is line-per-link: "Link 2 (enp6s18): 1.2.3.4".
-    # (resolvectl 255 has no JSON mode for status; the text here is stable.)
-    text = linux.run(["resolvectl", "dns"], timeout=5)
-    if text:
-        servers: list[str] = []
-        for line in text.splitlines():
-            _, found, tail = line.partition(":")
-            if not found:
-                continue
-            for address in tail.split():
-                if address not in servers:
-                    servers.append(address)
-        if servers:
-            domain = None
-            domain_text = linux.run(["resolvectl", "domain"], timeout=5) or ""
-            for line in domain_text.splitlines():
-                _, found, tail = line.partition(":")
-                if found and tail.strip():
-                    domain = tail.split()[0]
-                    break
-            return servers, domain, "systemd-resolved"
-    servers = []
-    domain = None
-    for line in (linux.read_text("/etc/resolv.conf") or "").splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0] == "nameserver":
-            servers.append(parts[1])
-        elif len(parts) >= 2 and parts[0] in ("domain", "search"):
-            domain = domain or parts[1]
-    return servers, domain, "/etc/resolv.conf"
+_TCP_INFO_REASON = windows.not_capable(
+    "per-connection RTT, retransmits and byte counters need "
+    "GetPerTcpConnectionEStats, which requires the connection to have been "
+    "opted in and administrator rights; only the socket table is read")
 
 
-def _socket_table(processes: list[dict], conn_prev: dict[tuple[str, str], tuple[float, int, int]],
-                  now: float) -> dict[str, object]:
-    """Aggregate socket state plus listeners and peers per process.
+def _socket_table(processes: list[dict]) -> dict[str, object]:
+    """Aggregate socket state, plus the listeners and remote peers per process.
 
-    /proc/net/* is world-readable, but mapping a socket inode to its owning
-    PID needs that process's /proc/<pid>/fd -- so other users' sockets appear
-    with pid=null. Counted and reported, never hidden.
-
-    Each established TCP connection also carries what the kernel knows about
-    it, read passively -- no probe is sent, so no peer sees anything: the
-    smoothed round-trip time and retransmit count (`ss -ti`, ~10 ms for a
-    few hundred sockets; the one unprivileged place tcp_info is exposed), the
-    send and receive queues (a send queue that stays full means the peer is
-    not draining; a receive queue that does means this process is not
-    reading), and a byte rate from two readings of the connection's counters.
-    Without `ss` the queues still come from /proc/net/tcp and the rest is
-    honestly absent. Summed per process this is also "who is using the
-    network", which no /proc counter gives directly.
+    The extended TCP/UDP tables name the owning PID of every socket, so a
+    Windows box has no unattributed sockets in the Linux sense; psutil can
+    still raise AccessDenied for the table as a whole under a restricted
+    account, which is reported, not raised.
     """
     try:
         connections = psutil.net_connections(kind="inet")
     except (psutil.AccessDenied, PermissionError) as exc:
-        return {"available": False, "reason": f"access denied: {exc}",
-                "by_state": {}, "entries": []}
+        return _no_sockets(f"access denied: {exc}")
     except Exception as exc:  # noqa: BLE001
-        return {"available": False, "reason": str(exc), "by_state": {},
-                "entries": []}
+        return _no_sockets(str(exc))
 
     names: dict[int, tuple[str | None, str | None]] = {}
     for row in processes:
         try:
-            names[int(row.get("pid"))] = (row.get("name"), row.get("unit"))  # type: ignore[arg-type]
+            names[int(row.get("pid"))] = (row.get("name"), None)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             continue
-    info, ss_reason = _ss_established()
-    if ss_reason is not None:
-        info = _proc_net_established()
 
     by_state: dict[str, int] = {}
     by_pid: dict[int, dict[str, object]] = {}
     listeners: list[dict[str, object]] = []
     established: list[dict[str, object]] = []
     unattributed = 0
-    seen_keys: set[tuple[str, str]] = set()
 
     for conn in connections:
         state = conn.status or "NONE"
@@ -482,8 +425,8 @@ def _socket_table(processes: list[dict], conn_prev: dict[tuple[str, str], tuple[
         pid = conn.pid or 0
         if not conn.pid:
             unattributed += 1
-        slot = by_pid.setdefault(pid, {"pid": pid, "established": 0,
-                                       "listening": 0, "other": 0})
+        slot = by_pid.setdefault(pid, {"pid": pid, "established": 0, "listening": 0,
+                                       "other": 0})
         local = _addr(conn.laddr)
         remote = _addr(conn.raddr)
         if state == psutil.CONN_LISTEN:
@@ -494,36 +437,20 @@ def _socket_table(processes: list[dict], conn_prev: dict[tuple[str, str], tuple[
         elif state == psutil.CONN_ESTABLISHED:
             slot["established"] = int(slot["established"]) + 1  # type: ignore[arg-type]
             if pid and pid not in names:
-                # Not in the (trimmed) process table: one /proc read names it.
-                names[pid] = (linux.read_line(f"/proc/{pid}/comm"),
-                              linux.unit_from_cgroup(pid))
+                names[pid] = (_name_of(pid), None)
             name, unit = names.get(pid, (None, None))
-            entry: dict[str, object] = {"pid": pid, "name": name, "unit": unit,
-                                        "local": local, "remote": remote}
-            key = (str(local), str(remote))
-            stats = info.get(key) if conn.type == socket.SOCK_STREAM else None
-            if stats:
-                entry.update(stats)
-                sent, recv = stats.get("bytes_sent"), stats.get("bytes_received")
-                if isinstance(sent, int) and isinstance(recv, int):
-                    prev = conn_prev.get(key)
-                    if prev and now > prev[0]:
-                        dt = now - prev[0]
-                        entry["send_bytes_sec"] = round(max(0, sent - prev[1]) / dt)
-                        entry["recv_bytes_sec"] = round(max(0, recv - prev[2]) / dt)
-                    conn_prev[key] = (now, sent, recv)
-                    seen_keys.add(key)
-            established.append(entry)
+            established.append({
+                "pid": pid, "name": name, "unit": unit, "local": local,
+                "remote": remote,
+                # Not readable without ESTATS: None, never 0.
+                "tx_queue": None, "rx_queue": None, "rtt_ms": None,
+                "rtt_min_ms": None, "retrans": None,
+                "send_bytes_sec": None, "recv_bytes_sec": None,
+            })
         else:
             slot["other"] = int(slot["other"]) + 1  # type: ignore[arg-type]
 
-    # Connections that closed take their counters with them.
-    for key in [k for k in conn_prev if k not in seen_keys]:
-        del conn_prev[key]
-
     listeners.sort(key=lambda entry: str(entry["local"]))
-    established.sort(key=lambda e: -(float(e.get("send_bytes_sec") or 0)
-                                     + float(e.get("recv_bytes_sec") or 0)))
     return {
         "available": True,
         "reason": None,
@@ -532,17 +459,37 @@ def _socket_table(processes: list[dict], conn_prev: dict[tuple[str, str], tuple[
         "by_pid": by_pid,
         "unattributed": unattributed,
         "unattributed_note": (
-            f"{unattributed} socket(s) belong to other users' processes; "
-            "attributing them needs CAP_SYS_PTRACE or root"
-            if unattributed else None),
+            f"{unattributed} socket(s) have no owning process in the TCP/UDP "
+            "tables (closing, or owned by the kernel)" if unattributed else None),
         "listeners": listeners[:200],
         "established": established[:400],
         "per_process": _per_process(established, names),
-        # Whether the per-connection RTT / retransmits / byte counters were
-        # readable; the queues alone still come from /proc/net/tcp.
-        "tcp_info": ss_reason is None,
-        "tcp_info_reason": ss_reason,
+        "tcp_info": False,
+        "tcp_info_reason": _TCP_INFO_REASON,
     }
+
+
+def _no_sockets(reason: str) -> dict[str, object]:
+    return {"available": False, "reason": reason, "total": 0, "by_state": {},
+            "by_pid": {}, "unattributed": 0, "unattributed_note": None,
+            "listeners": [], "established": [], "per_process": [],
+            "tcp_info": False, "tcp_info_reason": _TCP_INFO_REASON}
+
+
+def _name_of(pid: int) -> str | None:
+    try:
+        return psutil.Process(pid).name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return None
+
+
+def _tuple(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v]
+    return [str(value)]
+
 
 
 def _per_process(established: list[dict[str, object]],
@@ -582,98 +529,6 @@ def _per_process(established: list[dict[str, object]],
     out.sort(key=lambda s: (-(int(s["send_bytes_sec"]) + int(s["recv_bytes_sec"])),  # type: ignore[arg-type]
                             -int(s["connections"])))  # type: ignore[arg-type]
     return out[:40]
-
-
-_SS_FIELDS = {
-    "rtt": "rtt_ms", "minrtt": "rtt_min_ms", "retrans": "retrans",
-    "bytes_sent": "bytes_sent", "bytes_received": "bytes_received",
-    "unacked": "unacked", "lastsnd": "last_send_ms", "lastrcv": "last_recv_ms",
-}
-
-
-def _ss_established() -> tuple[dict[tuple[str, str], dict[str, object]], str | None]:
-    """{(local, peer): tcp_info fields} for every established TCP socket,
-    from one `ss -tinH` (netlink inet_diag; no privilege needed). Second
-    value is the reason when it could not be read."""
-    if not shutil.which("ss"):
-        return {}, "iproute2 (`ss`) is not installed: per-connection RTT, retransmits and byte rates are unknown"
-    try:
-        proc = subprocess.run(["ss", "-tinH"], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {}, f"`ss -tin` failed: {exc}"
-    if proc.returncode != 0:
-        err = (proc.stderr or "").strip().splitlines()
-        return {}, f"`ss -tin` failed: {err[0] if err else f'exit {proc.returncode}'}"
-    out: dict[tuple[str, str], dict[str, object]] = {}
-    current: tuple[str, str] | None = None
-    queues: tuple[int, int] = (0, 0)
-    for line in proc.stdout.splitlines():
-        if not line.startswith((" ", "\t")):
-            fields = line.split()
-            # ESTAB <recv-q> <send-q> <local> <peer>
-            if len(fields) < 5 or fields[0] != "ESTAB":
-                current = None
-                continue
-            current = (fields[3], fields[4])
-            try:
-                queues = (int(fields[2]), int(fields[1]))
-            except ValueError:
-                queues = (0, 0)
-            out[current] = {"tx_queue": queues[0], "rx_queue": queues[1]}
-            continue
-        if current is None:
-            continue
-        stats = out[current]
-        for token in line.split():
-            key, sep, value = token.partition(":")
-            name = _SS_FIELDS.get(key)
-            if not sep or name is None:
-                continue
-            if key == "rtt":
-                value = value.split("/", 1)[0]
-            elif key == "retrans":
-                value = value.split("/", 1)[-1]   # current/total: keep the total
-            try:
-                number = float(value)
-            except ValueError:
-                continue
-            stats[name] = round(number, 3) if key in ("rtt", "minrtt") else int(number)
-    return out, None
-
-
-def _proc_net_established() -> dict[tuple[str, str], dict[str, object]]:
-    """Queues per established socket from /proc/net/tcp{,6} -- the fallback
-    when `ss` is absent. No RTT or byte counters live there."""
-    out: dict[tuple[str, str], dict[str, object]] = {}
-    for path, family in (("/proc/net/tcp", socket.AF_INET), ("/proc/net/tcp6", socket.AF_INET6)):
-        text = linux.read_text(path)
-        if not text:
-            continue
-        for line in text.splitlines()[1:]:
-            fields = line.split()
-            if len(fields) < 10 or fields[3] != "01":
-                continue
-            try:
-                local = _hex_addr(fields[1], family)
-                remote = _hex_addr(fields[2], family)
-                tx, _, rx = fields[4].partition(":")
-                out[(local, remote)] = {"tx_queue": int(tx, 16), "rx_queue": int(rx, 16),
-                                        "retrans": int(fields[6], 16)}
-            except (ValueError, OSError):
-                continue
-    return out
-
-
-def _hex_addr(text: str, family: int) -> str:
-    """'0100007F:1F90' -> '127.0.0.1:8080' in psutil's formatting."""
-    hex_ip, _, hex_port = text.rpartition(":")
-    port = int(hex_port, 16)
-    if family == socket.AF_INET:
-        ip = socket.inet_ntop(family, struct.pack("<I", int(hex_ip, 16)))
-        return f"{ip}:{port}"
-    words = [int(hex_ip[i:i + 8], 16) for i in range(0, 32, 8)]
-    ip = socket.inet_ntop(family, struct.pack("<IIII", *words))
-    return f"[{ip}]:{port}"
 
 
 def _connectivity(adapters: list[dict[str, object]]) -> dict[str, object]:
@@ -802,3 +657,4 @@ def _addr(addr: object) -> str | None:
     if ip is None:
         return None
     return f"[{ip}]:{port}" if ":" in str(ip) else f"{ip}:{port}"
+

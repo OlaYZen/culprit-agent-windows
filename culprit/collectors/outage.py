@@ -4,35 +4,36 @@ Slow and broken are different questions. The Lag Doctor gates on pressure;
 this looks at the things that stop a service working while every counter
 looks fine, and walks each one to its root:
 
-* a failed unit -- with the dependency that failed first and the first
-  error line of the root unit's own journal, quoted
-* a unit in a restart loop, with its last error line
-* a unit that is running but no longer listens on the port it held
+* an automatic service that is stopped -- with the service it depends on
+  that is stopped first (the SCM's dependency list, walked two levels) and
+  the Service Control Manager's last event about it, quoted
+* a service the SCM keeps restarting (7031 "terminated unexpectedly" three
+  times or more in a day)
+* a service that is running but no longer listens on the port it held
 * a TLS listener serving a certificate that has expired or is about to
   (read by connecting to the listener locally, nothing else)
-* the clock not synchronised
+* the clock not synchronised (w32tm)
 * DNS resolution failing at the resolver
-* a filesystem the kernel remounted read-only (writes fail from then on)
-* /boot too full for the next kernel
+* a volume that went read-only
 * storage reporting errors
 * a reboot the machine is waiting for
 
-Every item names the unit, the root, the evidence and the fix, carries how
+Every item names the service, the root, the evidence and the fix, carries how
 long it has held and what changed just before, and each check reports its
 own availability and reason: a source that could not be read is named,
 never rendered as "fine". Thresholds are not the point -- a certificate
 with eleven days left is information; an expired one on a live listener is
 the outage.
 
-Cost is a few subprocesses on the slow tier, each rate-limited: unit
-dependency walks only when the failed set changes, TLS handshakes to the
-box's own listeners once an hour, timedatectl once a minute.
+The certificate machinery is the Linux agent's, verbatim: a TLS handshake
+and a forty-line ASN.1 walk are the same on every OS. /boot has no Windows
+counterpart (the EFI system partition carries no letter and is not a
+capacity problem), and `checks.boot` says so.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 import socket
 import ssl
@@ -40,7 +41,7 @@ import struct
 import time
 from typing import Any
 
-from .. import linux
+from .. import windows
 from . import units as units_mod
 
 log = logging.getLogger("culprit.outage")
@@ -51,22 +52,15 @@ _SEV = {"info": 1, "warn": 2, "critical": 3}
 # not noise in someone's log; plus any listener held by a TLS terminator.
 _TLS_PORTS = frozenset({443, 8443, 4443, 9443, 10443, 993, 995, 465, 636, 853,
                         5001, 8883, 6514, 2376, 6443, 10250, 3269, 8006, 9200,
-                        9443, 5986})
-_TLS_TERMINATORS = ("nginx", "apache2", "httpd", "haproxy", "caddy", "traefik",
-                    "envoy", "stunnel", "dovecot", "lighttpd", "openresty")
+                        5986, 3389})
+_TLS_TERMINATORS = ("nginx", "httpd", "apache", "haproxy", "caddy", "traefik",
+                    "envoy", "stunnel", "w3wp", "iisexpress", "tomcat")
 _TLS_REFRESH_S = 3600.0
 _TLS_MAX_PORTS = 24
 _TIME_REFRESH_S = 60.0
-_RESOLVED_REFRESH_S = 300.0
 _LISTENER_HOLD_TICKS = 3        # a port must be held this many slow ticks to count
 _LISTENER_GONE_TICKS = 2        # and be gone this many before it is an item
-_BOOT_MIN_FREE = 150 * 1024 ** 2
-_NTP_UNITS = ("chrony", "chronyd", "ntpd", "ntp", "ntpsec", "openntpd",
-              "systemd-timesyncd")
-
-_UNIT_PROPS = ("Id,ActiveState,SubState,Result,ConditionResult,ExecMainStatus,"
-               "Requires,Requisite,BindsTo,Wants,After,InactiveEnterTimestamp,"
-               "Description,Type,RemainAfterExit")
+_LOOP_EVENTS = 3                # SCM crash events in a day before "looping"
 
 
 class OutageCollector:
@@ -76,17 +70,14 @@ class OutageCollector:
         self._failed_seen: frozenset[str] = frozenset()
         self._failed_at = 0.0
         self._roots: dict[str, dict[str, Any]] = {}
-        self._loop_lines: dict[str, dict[str, Any]] = {}
-        self._held: dict[tuple[str, int], int] = {}     # (unit, port) -> ticks seen
-        self._gone: dict[tuple[str, int], int] = {}     # (unit, port) -> ticks missing
+        self._held: dict[tuple[str, int], int] = {}     # (service, port) -> ticks seen
+        self._gone: dict[tuple[str, int], int] = {}     # (service, port) -> ticks missing
         self._tls: dict[int, dict[str, Any]] = {}
         self._tls_at = 0.0
         self._time: dict[str, Any] | None = None
         self._time_at = 0.0
         self._mounts_base: dict[str, bool] = {}
         self._dns_bad_ticks = 0
-        self._resolved_prev: tuple[float, int] | None = None
-        self._resolved_rate: float | None = None
 
     # ----------------------------------------------------------------- sample
     def sample(self, services: dict | None, ports: dict | None, volumes: dict | None,
@@ -97,7 +88,7 @@ class OutageCollector:
         items: list[dict[str, Any]] = []
         checks: dict[str, Any] = {}
 
-        items += self._units(services or {}, checks, now)
+        items += self._units(services or {}, checks, now, events)
         items += self._listeners(services or {}, ports or {}, checks)
         items += self._certificates(ports or {}, system or {}, checks, now)
         items += self._clock(services or {}, checks)
@@ -144,81 +135,106 @@ class OutageCollector:
         }
 
     # ------------------------------------------------------------------ units
-    def _units(self, services: dict, checks: dict[str, Any], now: float) -> list[dict[str, Any]]:
+    def _units(self, services: dict, checks: dict[str, Any], now: float,
+               events: dict | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         if not services.get("available"):
-            checks["units"] = {"available": False, "reason": services.get("reason") or "systemd not readable"}
+            checks["units"] = {"available": False,
+                               "reason": services.get("reason") or "the Service Control Manager is not readable"}
             return out
         problems = [p for p in (services.get("problems") or []) if isinstance(p, dict)]
-        failed = [p for p in problems if p.get("status") == "failed"]
-        looping = [p for p in problems if p.get("status") != "failed" and int(p.get("restarts") or 0) >= 3]
-        stopped = [p for p in problems if p.get("status") != "failed" and int(p.get("restarts") or 0) < 3]
+        # The SCM's own crash record: 7031/7034 per service in the last day.
+        crashes: dict[str, list[dict]] = {}
+        for event in ((events or {}).get("crashes") or {}).get("events") or []:
+            if not isinstance(event, dict) or event.get("source_key") != "service_fail":
+                continue
+            if float(event.get("timestamp") or 0) < now - 86400:
+                continue
+            name = str((event.get("service") or {}).get("name") or "")
+            if name:
+                crashes.setdefault(name.lower(), []).append(event)
+        by_name = {str(s.get("name")).lower(): s for s in (services.get("services") or [])
+                   if isinstance(s, dict)}
+        display = {k: str(v.get("display_name") or v.get("name")) for k, v in by_name.items()}
+
+        failed = [p for p in problems if p.get("severity") == "critical"]
+        stopped = [p for p in problems if p.get("severity") != "critical"]
+        looping = [s for key, s in by_name.items()
+                   if s.get("status") == "running" and len(crashes.get(key, [])) >= _LOOP_EVENTS]
+        looping_names = {str(s["name"]) for s in looping}
+        # Match the SCM's events to a service by either its name or its display
+        # name: the events carry whichever the message template used.
+        display_to_name = {v.lower(): k for k, v in display.items()}
+
+        def crash_events(name: str) -> list[dict]:
+            low = name.lower()
+            return crashes.get(low) or crashes.get(display.get(low, "").lower()) or []
+
         names = frozenset(str(p["name"]) for p in failed)
-        # Dependency walks and journal lines only when the failed set changes
-        # (or every ten minutes, in case the root recovered).
         if names != self._failed_seen or now - self._failed_at > 600:
             self._failed_seen, self._failed_at = names, now
-            scopes = {str(p["name"]): str(p.get("scope") or "system") for p in failed}
-            self._roots = {name: _root_of(name, scopes.get(name, "system")) for name in names}
+            self._roots = {name: _root_of(name, by_name) for name in names}
         for problem in failed:
             name = str(problem["name"])
             root = self._roots.get(name) or {}
             root_name = root.get("root")
-            title = f"{name} has failed"
+            title = f"{display.get(name.lower(), name)} has stopped with an error"
             if root_name and root_name != name:
-                title = f"{name} is down because {root_name} failed first"
-            line = root.get("line") or {}
-            detail = problem.get("detail") or "Unit failed."
-            if line.get("message"):
-                detail += f" {root_name or name}'s journal: \"{line['message']}\""
-            manager = str(problem.get("scope") or "system")
+                title = f"{name} is down because {root_name} stopped first"
+            last = (crash_events(root_name or name) or [None])[0]
+            line = ({"ts": last.get("timestamp"), "message": last.get("title"),
+                     "source": "Service Control Manager"} if last else None)
+            detail = problem.get("detail") or "Service stopped."
+            if line:
+                detail += f" The SCM logged: \"{line['message']}\""
             out.append({
                 "key": f"unit_failed:{name}", "kind": "unit", "severity": "critical",
-                "title": title, "detail": detail, "unit": name, "manager": manager,
+                "title": title, "detail": detail, "unit": name, "manager": "system",
                 "root": {"unit": root_name or name, "result": root.get("result") or problem.get("result"),
-                         "line": line or None, "chain": root.get("chain") or []},
-                "fix": f"journalctl -u {root_name or name} -e; then systemctl restart {root_name or name}"
-                       + (f" && systemctl restart {name}" if root_name and root_name != name else ""),
-                # The verbs the dashboard may offer for this item, decided
-                # here (guards included) so the host renders data, never
-                # invents a command for a unit it cannot see.
-                "actions": units_mod.offered("unit_failed", name, root_name, manager),
-                "evidence": {"result": problem.get("result"), "restarts": problem.get("restarts"),
-                             "scope": problem.get("scope")},
+                         "line": line, "chain": root.get("chain") or []},
+                "fix": (f"Get-WinEvent -LogName System -MaxEvents 50 | ? ProviderName -eq 'Service Control Manager' "
+                        f"| ? Message -match '{root_name or name}'; then Restart-Service {root_name or name}"
+                        + (f"; Restart-Service {name}" if root_name and root_name != name else "")),
+                "actions": units_mod.offered("unit_failed", name, root_name, "system"),
+                "evidence": {"result": problem.get("result"), "exit_status": problem.get("exit_status"),
+                             "restarts": None, "scope": "system"},
             })
-        for problem in looping:
-            name = str(problem["name"])
-            cached = self._loop_lines.get(name)
-            if cached is None or now - float(cached.get("at") or 0) > 600:
-                cached = {"at": now, "line": _last_error_line(name, str(problem.get("scope") or "system"))}
-                self._loop_lines[name] = cached
-            line = cached.get("line") or {}
-            manager = str(problem.get("scope") or "system")
+        for service in looping:
+            name = str(service["name"])
+            recent = crash_events(name)
+            last = recent[0] if recent else None
+            line = ({"ts": last.get("timestamp"), "message": last.get("title"),
+                     "source": "Service Control Manager"} if last else None)
             out.append({
                 "key": f"unit_looping:{name}", "kind": "unit", "severity": "warn",
-                "title": f"{name} is crash-looping ({problem.get('restarts')} restarts)",
-                "detail": (problem.get("detail") or "")
-                          + (f" Last error: \"{line['message']}\"" if line.get("message") else ""),
-                "unit": name, "manager": manager,
-                "root": {"unit": name, "result": problem.get("result"), "line": line or None, "chain": []},
-                "fix": f"journalctl -u {name} -e (the crash output); fix the cause, then systemctl restart {name}",
-                "actions": units_mod.offered("unit_looping", name, None, manager),
-                "evidence": {"restarts": problem.get("restarts"), "result": problem.get("result")},
+                "title": f"{display.get(name.lower(), name)} keeps terminating unexpectedly "
+                         f"({len(recent)} times in 24 h)",
+                "detail": ("The Service Control Manager has restarted it under its recovery policy; "
+                           "each restart loses the service's state and its clients' connections."
+                           + (f" Last: \"{line['message']}\"" if line else "")),
+                "unit": name, "manager": "system",
+                "root": {"unit": name, "result": "terminated unexpectedly", "line": line, "chain": []},
+                "fix": f"Get-WinEvent -LogName Application | ? Message -match '{name}' (the crash); fix the cause, "
+                       f"then Restart-Service {name}",
+                "actions": units_mod.offered("unit_looping", name, None, "system"),
+                "evidence": {"crashes_24h": len(recent), "restarts": len(recent)},
             })
         for problem in stopped:
             name = str(problem["name"])
-            manager = str(problem.get("scope") or "system")
+            if name in looping_names:
+                continue
             out.append({
                 "key": f"unit_stopped:{name}", "kind": "unit", "severity": "warn",
-                "title": f"{name} is enabled but not running",
-                "detail": problem.get("detail") or "", "unit": name, "manager": manager,
+                "title": f"{display.get(name.lower(), name)} is set to start automatically but is not running",
+                "detail": problem.get("detail") or "", "unit": name, "manager": "system",
                 "root": {"unit": name, "result": problem.get("result"), "line": None, "chain": []},
-                "fix": f"systemctl start {name}; if it stops again, journalctl -u {name} -e says why",
-                "actions": units_mod.offered("unit_stopped", name, None, manager),
+                "fix": f"Start-Service {name}; if it stops again, the System event log says why",
+                "actions": units_mod.offered("unit_stopped", name, None, "system"),
                 "evidence": {"result": problem.get("result")},
             })
         checks["units"] = {"available": True, "failed": len(failed), "looping": len(looping),
                            "stopped": len(stopped), "total": (services.get("summary") or {}).get("total")}
+        del display_to_name
         return out
 
     # -------------------------------------------------------------- listeners
@@ -227,17 +243,15 @@ class OutageCollector:
         if not ports.get("available"):
             checks["listeners"] = {"available": False, "reason": ports.get("reason") or "port map not readable"}
             return out
-        running = {str(s.get("name")) for s in (services.get("services") or [])
+        running = {str(s.get("display_name") or s.get("name")) for s in (services.get("services") or [])
                    if isinstance(s, dict) and s.get("status") == "running"}
-        scopes = {str(s.get("name")): str(s.get("scope") or "system")
-                  for s in (services.get("services") or []) if isinstance(s, dict)}
         current: set[tuple[str, int]] = set()
         for port in ports.get("ports") or []:
             if not isinstance(port, dict) or "tcp" not in (port.get("protocols") or []):
                 continue
             for proc in port.get("processes") or []:
                 unit = proc.get("unit") if isinstance(proc, dict) else None
-                if unit and str(unit).endswith(".service"):
+                if unit:
                     current.add((str(unit), int(port["port"])))
         for key in current:
             self._held[key] = self._held.get(key, 0) + 1
@@ -247,8 +261,6 @@ class OutageCollector:
             if unit in running and self._held[key] >= _LISTENER_HOLD_TICKS:
                 self._gone[key] = self._gone.get(key, 0) + 1
             else:
-                # The unit stopped too (that is a unit item), or the port
-                # was never held long enough to be its own.
                 del self._held[key]
                 self._gone.pop(key, None)
         for (unit, port), ticks in self._gone.items():
@@ -256,15 +268,15 @@ class OutageCollector:
                 out.append({
                     "key": f"not_listening:{unit}:{port}", "kind": "listener", "severity": "warn",
                     "title": f"{unit} is running but no longer listens on :{port}",
-                    "detail": f"The unit is active, but the port it held for the last "
+                    "detail": f"The service is running, but the port it held for the last "
                               f"{self._held.get((unit, port), 0)} samples is no longer bound. Clients get a "
-                              "connection refused while systemd still reports the service as running: a "
-                              "worker that died inside the unit, a bind that failed on reload, or a listener "
+                              "connection refused while the SCM still reports the service as running: a "
+                              "worker that died inside the service, a bind that failed, or a listener "
                               "moved to another address.",
-                    "unit": unit, "port": port, "manager": scopes.get(unit, "system"),
+                    "unit": unit, "port": port, "manager": "system",
                     "root": {"unit": unit, "result": None, "line": None, "chain": []},
-                    "fix": f"journalctl -u {unit} -e; ss -ltnp | grep :{port}; systemctl reload-or-restart {unit}",
-                    "actions": units_mod.offered("not_listening", unit, None, scopes.get(unit, "system")),
+                    "fix": f"netstat -abno | findstr :{port}; Restart-Service '{unit}'",
+                    "actions": units_mod.offered("not_listening", unit, None, "system"),
                     "evidence": {"port": port, "missing_samples": ticks},
                 })
         checks["listeners"] = {"available": True, "tracked": len(self._held), "missing": len(out)}
@@ -322,8 +334,8 @@ class OutageCollector:
                               "Clients start failing the moment it expires; renew before then.")),
                 "unit": info.get("unit"), "port": number,
                 "root": {"unit": info.get("unit"), "result": None, "line": None, "chain": []},
-                "fix": ("renew the certificate (certbot renew, or the issuing CA), then reload "
-                        f"{info.get('unit') or 'the service'}"),
+                "fix": ("renew the certificate (the issuing CA, or win-acme for Let's Encrypt), then "
+                        f"restart {info.get('unit') or 'the service'}"),
                 "evidence": {"days_left": days, "not_after": info.get("not_after"),
                              "issuer": info.get("issuer")},
             })
@@ -340,73 +352,57 @@ class OutageCollector:
             self._time_at = now
         info = self._time
         checks["time"] = info
-        if not info.get("available"):
+        if not info.get("available") or info.get("synchronized"):
             return []
-        if info.get("synchronized"):
-            return []
-        if info.get("ntp") is False and not info.get("daemon"):
+        if not info.get("daemon"):
             return [{
                 "key": "time_unsynced", "kind": "clock", "severity": "warn",
-                "title": "The clock is not synchronised: no time service is on",
-                "detail": "systemd-timesyncd is off and no chrony/ntpd unit is running. The clock drifts; "
-                          "TLS handshakes, Kerberos, log correlation and scheduled jobs go wrong quietly "
-                          "as it does.",
-                "root": {"unit": "systemd-timesyncd.service", "result": None, "line": None, "chain": []},
-                "fix": "timedatectl set-ntp true  (or install and enable chrony)",
-                "evidence": {"ntp": info.get("ntp"), "synchronized": False},
+                "title": "The clock is not synchronised: the Windows Time service is not running",
+                "detail": "W32Time is stopped, so nothing corrects the clock. It drifts; TLS handshakes, "
+                          "Kerberos sign-in and scheduled jobs go wrong quietly as it does.",
+                "root": {"unit": "W32Time", "result": None, "line": None, "chain": []},
+                "fix": "Start-Service W32Time; w32tm /resync",
+                "actions": units_mod.offered("unit_stopped", "W32Time", None, "system"),
+                "evidence": {"ntp": False, "synchronized": False},
             }]
         return [{
             "key": "time_unsynced", "kind": "clock", "severity": "warn",
             "title": "The clock is not synchronised",
-            "detail": (f"A time service is on ({info.get('daemon') or 'systemd-timesyncd'}) but reports the "
-                       "clock as not synchronised: the servers are unreachable, DNS cannot resolve them, "
-                       "or the service just started."
+            "detail": ("The Windows Time service is running but reports the clock as not synchronised: "
+                       "the time source is unreachable, DNS cannot resolve it, or the service just started."
+                       + (f" Source: {info['server']}." if info.get("server") else "")
                        + (f" Current offset {info['offset_ms']:.0f} ms." if isinstance(info.get("offset_ms"), (int, float)) else "")),
-            "root": {"unit": info.get("daemon") or "systemd-timesyncd.service", "result": None, "line": None, "chain": []},
-            "fix": "timedatectl timesync-status  (or chronyc tracking); check that UDP 123 to the servers is allowed",
-            "evidence": {"ntp": info.get("ntp"), "synchronized": False, "offset_ms": info.get("offset_ms")},
+            "root": {"unit": "W32Time", "result": None, "line": None, "chain": []},
+            "fix": "w32tm /query /status; w32tm /resync; check that UDP 123 to the source is allowed",
+            "evidence": {"ntp": True, "synchronized": False, "offset_ms": info.get("offset_ms")},
         }]
 
     # -------------------------------------------------------------------- dns
     def _dns(self, net_detail: dict, checks: dict[str, Any]) -> list[dict[str, Any]]:
         probe = (net_detail.get("connectivity") or {}).get("dns_resolution")
-        # resolved's counters go over D-Bus and measured ~1 s a call, so the
-        # timeout rate is read every five minutes, not every tick.
-        mono = time.monotonic()
-        if self._resolved_prev is None or mono - self._resolved_prev[0] >= _RESOLVED_REFRESH_S:
-            stats = _resolved_stats()
-            if stats is not None:
-                if self._resolved_prev and mono > self._resolved_prev[0]:
-                    self._resolved_rate = round(
-                        60 * max(0, stats - self._resolved_prev[1]) / (mono - self._resolved_prev[0]), 2)
-                self._resolved_prev = (mono, stats)
-            else:
-                self._resolved_prev = (mono, 0)
-        rate = self._resolved_rate
         if not isinstance(probe, dict):
-            checks["dns"] = {"available": False, "reason": "no resolution probe yet", "timeouts_per_min": rate}
+            checks["dns"] = {"available": False, "reason": "no resolution probe yet", "timeouts_per_min": None}
             self._dns_bad_ticks = 0
             return []
         ok = bool(probe.get("ok"))
         self._dns_bad_ticks = 0 if ok else self._dns_bad_ticks + 1
         checks["dns"] = {"available": True, "ok": ok, "latency_ms": probe.get("latency_ms"),
-                         "timeouts_per_min": rate, "error": probe.get("error"),
-                         "timeouts_reason": None if os.geteuid() == 0 else
-                         "resolved's timeout counter needs root (resolvectl statistics is "
-                         "polkit-guarded and would prompt on a desktop)"}
+                         "timeouts_per_min": None, "error": probe.get("error"),
+                         "timeouts_reason": windows.not_capable(
+                             "the DNS Client service keeps no readable timeout counter; the "
+                             "resolution probe is the signal")}
         if ok or self._dns_bad_ticks < 2:
             return []
         return [{
             "key": "dns_failing", "kind": "dns", "severity": "critical",
             "title": "DNS resolution is failing",
             "detail": ("The resolver could not resolve a name on two consecutive checks "
-                       f"({probe.get('error') or 'no answer'}). Package installs, sync clients, TLS "
-                       "(OCSP), mail and most of the web fail while this holds; services that cache "
-                       "addresses keep working until they restart, which hides it."
-                       + (f" systemd-resolved counts {rate:.1f} timeouts/min." if rate else "")),
-            "root": {"unit": "systemd-resolved.service", "result": None, "line": None, "chain": []},
-            "fix": "resolvectl status; resolvectl query example.com; check the upstream servers and UDP/TCP 53",
-            "evidence": {"error": probe.get("error"), "timeouts_per_min": rate},
+                       f"({probe.get('error') or 'no answer'}). Domain sign-in, mapped drives, sync clients, "
+                       "TLS (OCSP), mail and most of the web fail while this holds; services that cache "
+                       "addresses keep working until they restart, which hides it."),
+            "root": {"unit": "Dnscache", "result": None, "line": None, "chain": []},
+            "fix": "ipconfig /all (the configured servers); Resolve-DnsName example.com; ipconfig /flushdns",
+            "evidence": {"error": probe.get("error")},
         }]
 
     # ----------------------------------------------------------------- mounts
@@ -425,22 +421,21 @@ class OutageCollector:
             if not first:
                 out.append({
                     "key": f"readonly:{mount}", "kind": "mount", "severity": "critical",
-                    "title": f"{mount} was remounted read-only",
-                    "detail": (f"{mount} ({fstype}) was writable when the agent started and is mounted read-only "
-                               "now. The kernel does that after a filesystem error (errors=remount-ro): every "
-                               "write there fails from that moment, while reads and the processes look fine."),
+                    "title": f"{mount} went read-only",
+                    "detail": (f"{mount} ({fstype}) was writable when the agent started and is read-only "
+                               "now. NTFS does that after a filesystem error, and a drive that lost its "
+                               "connection comes back read-only: every write there fails from that moment."),
                     "mount": mount, "root": {"unit": None, "result": None, "line": None, "chain": []},
-                    "fix": f"dmesg | grep -i {fstype}; back up, then fsck {volume.get('device')} from a rescue boot",
+                    "fix": f"Get-WinEvent -LogName System | ? ProviderName -match 'Ntfs|disk'; chkdsk {mount} /scan",
                     "evidence": {"fstype": fstype, "device": volume.get("device")},
                 })
-            elif mount in ("/", "/var", "/home", "/tmp", "/srv", "/opt", "/var/log", "/var/lib"):
+            elif mount.upper().startswith("C:"):
                 out.append({
                     "key": f"readonly:{mount}", "kind": "mount", "severity": "warn",
-                    "title": f"{mount} is mounted read-only",
-                    "detail": (f"{mount} ({fstype}) has been read-only since the agent started. On an image "
-                               "meant to be immutable that is by design; on anything else, writes are failing."),
+                    "title": f"{mount} is read-only",
+                    "detail": f"{mount} ({fstype}) has been read-only since the agent started; writes are failing.",
                     "mount": mount, "root": {"unit": None, "result": None, "line": None, "chain": []},
-                    "fix": f"mount | grep ' {mount} '; dmesg | grep -i {fstype}",
+                    "fix": f"chkdsk {mount} /scan; Get-Volume",
                     "evidence": {"fstype": fstype, "device": volume.get("device")},
                 })
         for gone in [m for m in self._mounts_base if m not in {str(v.get("mountpoint")) for v in entries}]:
@@ -449,48 +444,31 @@ class OutageCollector:
         return out
 
     # ------------------------------------------------------------------- boot
-    def _boot(self, volumes: dict, checks: dict[str, Any]) -> list[dict[str, Any]]:
-        boot = next((v for v in (volumes.get("volumes") or [])
-                     if isinstance(v, dict) and v.get("mountpoint") == "/boot"), None)
-        if boot is None:
-            checks["boot"] = {"available": True, "separate": False}
-            return []
-        free = int(boot.get("free") or 0)
-        checks["boot"] = {"available": True, "separate": True, "free": free, "total": boot.get("total"),
-                          "ok": free >= _BOOT_MIN_FREE}
-        if free >= _BOOT_MIN_FREE:
-            return []
-        return [{
-            "key": "boot_full", "kind": "mount", "severity": "warn",
-            "title": f"/boot has {free / 1024 ** 2:.0f} MB free: the next kernel will not fit",
-            "detail": "A kernel image plus its initramfs needs roughly 100-150 MB. The next kernel upgrade "
-                      "fails half-way, which on Debian and Ubuntu leaves apt broken until old kernels are "
-                      "removed by hand.",
-            "mount": "/boot", "root": {"unit": None, "result": None, "line": None, "chain": []},
-            "fix": "apt autoremove --purge  (or dnf remove old kernels); then df -h /boot",
-            "evidence": {"free": free, "total": boot.get("total")},
-        }]
+    def _boot(self, volumes: dict, checks: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: ARG002
+        checks["boot"] = {"available": True, "separate": False,
+                          "reason": windows.not_capable("the EFI system partition holds only the "
+                                                        "boot loader; kernels are not staged there")}
+        return []
 
     # ------------------------------------------------------------ disk errors
     def _disk_errors(self, events: dict, checks: dict[str, Any], now: float) -> list[dict[str, Any]]:
         crashes = ((events.get("crashes") or {}).get("events")) or []
         recent = [e for e in crashes if isinstance(e, dict) and e.get("source_key") == "disk_error"
                   and float(e.get("timestamp") or 0) >= now - 86400]
-        checks["storage"] = {"available": bool((events.get("journal") or {}).get("readable", True)),
-                             "errors_24h": len(recent),
-                             "reason": None if (events.get("journal") or {}).get("readable", True)
-                             else (events.get("journal") or {}).get("reason")}
+        readable = (events.get("journal") or {}).get("readable", True)
+        checks["storage"] = {"available": bool(readable), "errors_24h": len(recent),
+                             "reason": None if readable else (events.get("journal") or {}).get("reason")}
         if not recent:
             return []
         latest = recent[0]
         return [{
             "key": "disk_errors", "kind": "storage", "severity": "warn",
             "title": f"Storage reported {len(recent)} error{'s' if len(recent) != 1 else ''} in the last 24 h",
-            "detail": f"The kernel logged \"{latest.get('title')}\" at "
+            "detail": f"The System log has \"{latest.get('title')}\" at "
                       f"{time.strftime('%H:%M', time.localtime(float(latest.get('timestamp') or now)))}. "
-                      "IO errors precede a remount read-only and a dead disk; check SMART and back up first.",
+                      f"{latest.get('detail') or ''} Check the drive's health and back up first.",
             "root": {"unit": None, "result": None, "line": None, "chain": []},
-            "fix": "dmesg -T | grep -iE 'I/O error|EXT4-fs error|nvme|ata'; smartctl -a on the device; back up",
+            "fix": "Get-WinEvent -LogName System | ? ProviderName -match 'disk|Ntfs|stor'; Get-PhysicalDisk | Get-StorageReliabilityCounter",
             "evidence": {"errors_24h": len(recent), "latest": latest.get("timestamp")},
         }]
 
@@ -505,90 +483,79 @@ class OutageCollector:
         return [{
             "key": "reboot_pending", "kind": "reboot", "severity": "info",
             "title": "A reboot is pending",
-            "detail": "; ".join(reasons) + ". Nothing is broken by this alone, but processes running "
-                      "against replaced libraries or an old kernel keep the old code, fixes included.",
+            "detail": "; ".join(reasons) + ". Nothing is broken by this alone, but staged updates and "
+                      "queued file replacements do not take effect until the restart.",
             "root": {"unit": None, "result": None, "line": None, "chain": []},
-            "fix": "schedule the reboot (or restart the listed services)",
+            "fix": "schedule the restart",
             "evidence": {"reasons": reasons},
         }]
 
 
-# ------------------------------------------------------------- unit roots
-def _unit_props(name: str, scope_flag: list[str] | None = None) -> dict[str, str]:
-    text = linux.run(["systemctl", *(scope_flag or []), "show", "-p", _UNIT_PROPS, "--", name],
-                     timeout=5)
-    fields: dict[str, str] = {}
-    for line in (text or "").splitlines():
-        key, found, value = line.partition("=")
-        if found:
-            fields[key] = value
-    return fields
-
-
-def _root_of(name: str, scope: str = "system", depth: int = 2) -> dict[str, Any]:
-    """The dependency that failed first, walking Requires/Requisite/BindsTo
-    (and Wants) at most `depth` levels, plus the root's first error line."""
-    flag = ["--user"] if scope == "user" else []
+# ------------------------------------------------------------- service roots
+def _root_of(name: str, by_name: dict[str, dict], depth: int = 2) -> dict[str, Any]:
+    """The service this one depends on that is stopped first, walking the
+    SCM's dependency list at most `depth` levels."""
     chain: list[dict[str, Any]] = []
-    seen = {name}
+    seen = {name.lower()}
     current = name
     root = name
-    root_props = _unit_props(name, flag)
+    root_entry = by_name.get(name.lower()) or {}
     for _ in range(depth):
-        props = root_props if current == name else _unit_props(current, flag)
-        deps: list[str] = []
-        for key in ("Requires", "Requisite", "BindsTo", "Wants"):
-            deps += [d for d in (props.get(key) or "").split() if d and d not in seen]
-        # Only dependencies that are themselves failed (or inactive with a
-        # failed result) explain anything; a healthy dependency does not.
-        culprit_dep = None
+        deps = windows.service_dependencies(current) or []
+        culprit = None
         for dep in deps:
-            if dep.endswith((".target", ".slice", ".socket", ".mount", ".device")):
-                if not dep.endswith(".mount"):
-                    continue
-            dprops = _unit_props(dep, flag)
-            state = dprops.get("ActiveState")
-            result = dprops.get("Result")
-            if state == "failed" or (state == "inactive" and result not in (None, "", "success")):
-                culprit_dep = (dep, dprops)
+            low = dep.lower()
+            if low in seen:
+                continue
+            entry = by_name.get(low)
+            if entry is None:
+                continue
+            if entry.get("status") in ("stopped", "paused") and entry.get("start_type") != "disabled":
+                culprit = (dep, entry)
                 break
-        if culprit_dep is None:
+        if culprit is None:
             break
-        dep, dprops = culprit_dep
-        seen.add(dep)
-        chain.append({"unit": dep, "state": dprops.get("ActiveState"), "result": dprops.get("Result"),
-                      "description": dprops.get("Description")})
-        root, root_props, current = dep, dprops, dep
-    return {"root": root, "result": root_props.get("Result"),
-            "state": root_props.get("ActiveState"), "chain": chain,
-            "line": _last_error_line(root, scope)}
+        dep, entry = culprit
+        seen.add(dep.lower())
+        chain.append({"unit": dep, "state": entry.get("status"), "result": entry.get("result"),
+                      "description": entry.get("display_name")})
+        root, root_entry, current = dep, entry, dep
+    return {"root": root, "result": root_entry.get("result"),
+            "state": root_entry.get("status"), "chain": chain, "line": None}
 
 
-def _last_error_line(unit: str, scope: str = "system") -> dict[str, Any] | None:
-    """The newest error-priority line from the unit's own journal in this
-    boot; the unit's stdout/stderr and systemd's own verdict are both there.
-    A user unit is matched on _SYSTEMD_USER_UNIT (--user-unit), which reads
-    the user's own journal without the group the system journal needs."""
-    match = ["--user-unit", unit] if scope == "user" else ["-u", unit]
-    entries = linux.journalctl_json(["-b", *match, "-p", "err"], timeout=10, max_entries=1)
-    if not entries:
-        entries = linux.journalctl_json(["-b", *match], timeout=10, max_entries=1)
-    if not entries:
-        return None
-    entry = entries[0]
-    message = entry.get("MESSAGE")
-    if isinstance(message, list):
-        try:
-            message = bytes(message).decode("utf-8", "replace")
-        except (TypeError, ValueError):
-            message = ""
-    raw = entry.get("_SOURCE_REALTIME_TIMESTAMP") or entry.get("__REALTIME_TIMESTAMP")
-    try:
-        ts = int(raw) / 1e6
-    except (TypeError, ValueError):
-        ts = None
-    return {"ts": ts, "message": str(message or "").split("\n", 1)[0][:300],
-            "source": entry.get("SYSLOG_IDENTIFIER") or entry.get("_COMM")}
+# ------------------------------------------------------------------- clock
+def _time_sync(services: dict) -> dict[str, Any]:
+    """w32tm's view: the Leap Indicator is 3 while the clock is unsynchronised,
+    and the status carries the source and the phase offset."""
+    daemon = next((str(s.get("name")) for s in (services.get("services") or [])
+                   if isinstance(s, dict) and s.get("status") == "running"
+                   and str(s.get("name", "")).lower() == "w32time"), None)
+    text = windows.run(["w32tm", "/query", "/status"], timeout=5)
+    if text is None:
+        if not windows.IS_WINDOWS:
+            return {"available": False, "reason": "w32tm only exists on Windows",
+                    "synchronized": None, "ntp": None, "daemon": None, "offset_ms": None, "server": None}
+        # w32tm exits non-zero while the service is stopped; that is the answer.
+        return {"available": True, "reason": None, "ntp": daemon is not None,
+                "synchronized": False, "daemon": daemon, "offset_ms": None, "server": None}
+    out: dict[str, Any] = {"available": True, "reason": None, "ntp": daemon is not None,
+                           "synchronized": False, "daemon": daemon, "offset_ms": None,
+                           "server": None, "last_sync": None}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip().lower(), value.strip()
+        if key == "leap indicator":
+            out["synchronized"] = value.startswith("0")
+        elif key == "source":
+            out["server"] = value or None
+        elif key == "phase offset":
+            match = re.match(r"([+-]?[\d.]+)s", value)
+            if match:
+                out["offset_ms"] = round(float(match.group(1)) * 1000, 3)
+        elif key == "last successful sync time":
+            out["last_sync"] = value or None
+    return out
 
 
 # ------------------------------------------------------------ certificates
@@ -712,54 +679,3 @@ def _parse_cert(der: bytes) -> dict[str, Any]:
             "subject": _name(der, subject[1], subject[2]), "issuer": _name(der, issuer[1], issuer[2])}
 
 
-# ------------------------------------------------------------------- clock
-def _time_sync(services: dict) -> dict[str, Any]:
-    text = linux.run(["timedatectl", "show", "-p", "NTP", "-p", "NTPSynchronized", "-p", "CanNTP"],
-                     timeout=5)
-    if text is None:
-        return {"available": False, "reason": "timedatectl is not available (no systemd-timedated)"}
-    fields = dict(line.partition("=")[::2] for line in text.splitlines() if "=" in line)
-    daemon = next((str(s.get("name")) for s in (services.get("services") or [])
-                   if isinstance(s, dict) and s.get("status") == "running"
-                   and str(s.get("name", "")).split(".")[0] in _NTP_UNITS), None)
-    out: dict[str, Any] = {
-        "available": True, "reason": None,
-        "ntp": fields.get("NTP") == "yes",
-        "synchronized": fields.get("NTPSynchronized") == "yes",
-        "daemon": daemon, "offset_ms": None, "server": None,
-    }
-    status = linux.run(["timedatectl", "timesync-status"], timeout=5) or ""
-    for line in status.splitlines():
-        key, _, value = line.partition(":")
-        key, value = key.strip().lower(), value.strip()
-        if key == "server":
-            out["server"] = value
-        elif key == "offset":
-            match = re.match(r"([+-]?[\d.]+)\s*(us|ms|s)", value)
-            if match:
-                number, unit = float(match.group(1)), match.group(2)
-                out["offset_ms"] = round(number / 1000 if unit == "us" else number * 1000 if unit == "s" else number, 3)
-    if out["offset_ms"] is None and daemon and daemon.startswith("chrony"):
-        tracking = linux.run(["chronyc", "tracking"], timeout=5) or ""
-        match = re.search(r"System time\s*:\s*([\d.]+) seconds (slow|fast)", tracking)
-        if match:
-            out["offset_ms"] = round(float(match.group(1)) * 1000 * (-1 if match.group(2) == "slow" else 1), 3)
-    return out
-
-
-def _resolved_stats() -> int | None:
-    """systemd-resolved's own timeout counter, or None without resolved.
-
-    Root only: `resolvectl statistics` is guarded by the polkit action
-    org.freedesktop.resolve1.dump-statistics (systemd 254+), and for an
-    unprivileged user the desktop's polkit agent answers it with a password
-    prompt every time. A monitoring agent must never raise a dialog on the
-    machine it watches, so without root the counter is honestly absent.
-    """
-    if os.geteuid() != 0:
-        return None
-    text = linux.run(["resolvectl", "statistics"], timeout=5)
-    if not text:
-        return None
-    match = re.search(r"Total Timeouts:\s*(\d+)", text)
-    return int(match.group(1)) if match else None

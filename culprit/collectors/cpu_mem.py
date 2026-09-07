@@ -1,443 +1,356 @@
 """CPU and memory sampling -- the 1Hz hot path.
 
-Everything here is a plain /proc or /sys read; the whole sample costs about a
-millisecond, where the Windows PDH version cost ~25ms. Field names are kept
-compatible with the Windows payload wherever the semantics genuinely map
-(commit charge <-> Committed_AS, hard faults <-> pgmajfault), so the frontend
-keeps working; fields with no Linux meaning are None, which renders as an em
-dash rather than a lying zero.
+Uses PDH in preference to psutil for anything PDH does better:
 
-What Linux adds that Windows could not provide:
+* `% Processor Utility` instead of `% Processor Time`. The classic counter is
+  normalised to the base clock, so a CPU running at 60% of base clock while
+  fully loaded reports ~60%. Utility accounts for frequency scaling and is what
+  Task Manager shows.
+* `\\System\\Processor Queue Length` -- threads that are runnable but waiting for
+  a core. This, not raw CPU%, is what "the machine feels slow" actually means.
+* `\\Memory\\Pages/sec` -- hard faults. Distinguishes "RAM is full" from "RAM is
+  full and Windows is now paging to disk", which is the difference between a
+  warning and an explanation.
 
-* **PSI** (/proc/pressure/*): the kernel's own measurement of time spent
-  stalled on CPU, memory and IO -- the honest version of the pressure model.
-* **iowait** and **steal** per-CPU: steal matters on VMs (this dev box is one).
-* `procs_blocked`: how many tasks are in uninterruptible sleep right now.
-
-Two counters honestly do not exist here: Windows' "% Processor Utility"
-(frequency-normalised) and a system-wide syscall rate. `total` is time-based
-utilisation and `system_calls` stays None rather than being faked.
+The payload keeps the Linux agent's shape exactly, because the host and the
+dashboard read that shape. Fields the Linux kernel has and Windows does not --
+PSI, iowait, steal, the load average, uninterruptible tasks -- are `None`
+(rendered as an em dash, never as a lying zero) and `degraded` names why.
+Two Windows facts go the other way: the commit limit *is* enforced here
+(`commit_enforced: True`, so the Lag Doctor's commit signal applies the way it
+only does under strict overcommit on Linux), and the kernel pools have no
+Linux counterpart (`pool_paged` / `pool_nonpaged` are Windows-only extras).
 """
 
 from __future__ import annotations
 
-import os
 import time
 
-from .. import linux
+import psutil
+
+from .. import windows
 from ..util import clamp, safe_div
 
-_CLK_TCK = os.sysconf("SC_CLK_TCK")
+# key -> counter path. Every one of these is optional; a missing counter blanks
+# one field rather than failing the tick.
+_COUNTERS: tuple[tuple[str, str], ...] = (
+    ("cpu_utility", r"\Processor Information(_Total)\% Processor Utility"),
+    ("cpu_performance", r"\Processor Information(_Total)\% Processor Performance"),
+    ("cpu_frequency", r"\Processor Information(_Total)\Processor Frequency"),
+    ("cpu_privileged", r"\Processor Information(_Total)\% Privileged Time"),
+    ("cpu_interrupt", r"\Processor Information(_Total)\% Interrupt Time"),
+    ("cpu_dpc", r"\Processor Information(_Total)\% DPC Time"),
+    ("cpu_user", r"\Processor Information(_Total)\% User Time"),
+    ("queue_length", r"\System\Processor Queue Length"),
+    ("context_switches", r"\System\Context Switches/sec"),
+    ("system_calls", r"\System\System Calls/sec"),
+    ("processes", r"\System\Processes"),
+    ("threads", r"\System\Threads"),
+    ("mem_available_mb", r"\Memory\Available MBytes"),
+    ("mem_committed", r"\Memory\Committed Bytes"),
+    ("mem_commit_limit", r"\Memory\Commit Limit"),
+    ("hard_faults", r"\Memory\Pages/sec"),
+    ("pages_in", r"\Memory\Pages Input/sec"),
+    ("pages_out", r"\Memory\Pages Output/sec"),
+    ("page_faults", r"\Memory\Page Faults/sec"),
+    ("mem_cache", r"\Memory\Cache Bytes"),
+    ("pool_nonpaged", r"\Memory\Pool Nonpaged Bytes"),
+    ("pool_paged", r"\Memory\Pool Paged Bytes"),
+    ("pagefile_usage", r"\Paging File(_Total)\% Usage"),
+    ("dirty_pages", r"\Cache\Dirty Pages"),
+)
+
+# Per-core utility, as a wildcard array. Instance names are "0,0" / "0,1" on
+# multi-group machines and plain "0" / "1" otherwise, plus a "_Total" to drop.
+_PERCORE = (r"\Processor Information(*)\% Processor Utility", "percore_utility")
+
+# Thermal zones exist on some machines only (the original dev laptop had
+# none), and the counter reports Kelvin.
+_THERMAL = (r"\Thermal Zone Information(*)\Temperature", "thermal_temp")
+_THROTTLE = (r"\Thermal Zone Information(*)\% Passive Limit", "thermal_limit")
 
 
 class CpuMemoryCollector:
     def __init__(self) -> None:
-        self._prev_stat = _read_proc_stat()
-        self._prev_vmstat = _read_vmstat()
-        self._prev_at = time.monotonic()
-        self.psi_available = linux.psi_available()
-        self.container = linux.in_container()
-        # Thermal/power throttling counters exist only where the driver
-        # exposes them (x86 with the intel/amd throttle drivers, bare metal);
-        # a VM has none, and the payload says so instead of showing 0 events.
-        self._throttle_paths = _throttle_counter_paths()
-        self._prev_throttle: tuple[float, int] | None = None
+        self.query = windows.PdhQuery("cpu_mem")
+        self.query.add_many(_COUNTERS)
+        self.has_percore = self.query.add(_PERCORE[1], _PERCORE[0], array=True)
+        self.has_thermal = self.query.add(_THERMAL[1], _THERMAL[0], array=True)
+        self.query.add(_THROTTLE[1], _THROTTLE[0], array=True)
+        # The Linux agent reports these; both are honestly absent here.
+        self.psi_available = False
+        self.container = None
+        # Prime psutil's internal deltas so the first real sample is not 0.0.
+        psutil.cpu_percent(percpu=True)
+        psutil.cpu_percent()
+        self.query.collect()
         self._swap_devices: list[dict[str, object]] = []
         self._swap_checked = 0.0
 
     @property
     def degraded(self) -> dict[str, str]:
-        out: dict[str, str] = {}
-        if not self.psi_available:
-            out["psi"] = ("/proc/pressure/ does not exist -- kernel < 4.20, "
-                          "CONFIG_PSI=n, or psi=1 missing from the kernel "
-                          "command line. Pressure falls back to the derived "
-                          "model.")
-        if self.container:
-            out["container"] = (
-                f"running inside a {self.container} container: /proc/stat and "
-                "/proc/meminfo show the HOST unless lxcfs is mounted"
-            )
+        out = dict(self.query.unavailable)
+        out["psi"] = windows.not_capable(
+            "PSI (pressure stall information) is a Linux kernel interface; "
+            "pressure comes from the derived model (utilisation, run queue, "
+            "hard faults, disk latency).")
+        out["load"] = windows.not_capable(
+            "Windows keeps no load average or D-state count; the run queue "
+            "depth (queue_per_core) is the equivalent signal.")
         return out
 
     def sample(self) -> dict[str, object]:
-        now = time.monotonic()
-        elapsed = max(1e-3, now - self._prev_at)
-        stat = _read_proc_stat()
-        vmstat = _read_vmstat()
-        prev_stat, prev_vmstat = self._prev_stat, self._prev_vmstat
-        self._prev_stat, self._prev_vmstat, self._prev_at = stat, vmstat, now
+        query = self.query
+        query.collect()
 
-        cpu = self._cpu_section(stat, prev_stat, elapsed)
-        memory = self._memory_section(vmstat, prev_vmstat, elapsed)
-        psi = linux.system_psi()
+        virtual = psutil.virtual_memory()
+        swap = psutil.swap_memory()
 
-        return {"cpu": cpu, "memory": memory, "psi": psi}
+        # Prefer PDH utility; fall back to psutil if the counter set is missing.
+        utility = query.value("cpu_utility")
+        psutil_total = psutil.cpu_percent()
+        total = clamp(utility if utility is not None else psutil_total)
 
-    # ------------------------------------------------------------------ CPU
-    def _cpu_section(self, stat: dict, prev: dict, elapsed: float) -> dict:
-        total_row = _cpu_percent(stat.get("cpu"), prev.get("cpu"))
         per_core: list[float] = []
-        index = 0
-        while f"cpu{index}" in stat:
-            row = _cpu_percent(stat[f"cpu{index}"], prev.get(f"cpu{index}"))
-            per_core.append(row["busy"])
-            index += 1
-        logical = max(1, len(per_core))
+        if self.has_percore:
+            array = query.array("percore_utility")
+            # Two kinds of aggregate instance have to be dropped, not one: the
+            # machine-wide "_Total" and -- on multi-processor-group machines --
+            # a per-group "0,_Total". Filtering only the exact string "_Total"
+            # left a 13th value on a 12-core box that was really the total.
+            cores = [
+                (_core_sort_key(name), clamp(value))
+                for name, value in array.items()
+                if "_total" not in name.lower()
+            ]
+            per_core = [value for _, value in sorted(cores, key=lambda item: item[0])]
+        if not per_core:
+            per_core = [clamp(v) for v in psutil.cpu_percent(percpu=True)]
 
-        loadavg = (linux.read_line("/proc/loadavg") or "").split()
-        load1 = load5 = load15 = None
-        thread_count = None
-        try:
-            load1, load5, load15 = (float(loadavg[0]), float(loadavg[1]),
-                                    float(loadavg[2]))
-            # Fourth field is "runnable/total scheduling entities" -- the total
-            # is the system thread count, free of charge.
-            thread_count = int(loadavg[3].split("/")[1])
-        except (IndexError, ValueError):
-            pass
+        logical = psutil.cpu_count(logical=True) or 1
+        queue = query.value("queue_length")
+        committed = query.value("mem_committed")
+        commit_limit = query.value("mem_commit_limit")
+        times = psutil.cpu_times_percent()
+        interrupt = query.value("cpu_interrupt")
+        dpc = query.value("cpu_dpc")
+        # DPC time is the Windows analogue of softirq time; both are "the
+        # kernel servicing devices", so they are reported together the way
+        # Linux reports irq + softirq under `interrupt`.
+        interrupt_total = (None if interrupt is None and dpc is None
+                           else (interrupt or 0.0) + (dpc or 0.0))
 
-        # procs_running counts *us* taking this sample; the queue the user
-        # feels is everyone else. Same role as the Windows processor queue.
-        running = stat.get("procs_running")
-        queue = max(0, int(running) - 1) if running is not None else None
-
-        ctxt = _rate_of(stat, prev, "ctxt", elapsed)
-
-        return {
-            # Time-based utilisation. Linux has no frequency-normalised
-            # "utility" counter, so both fields carry the same number and the
-            # UI's "time-based" annotation stays truthful.
-            "total": total_row["busy"],
-            "total_time_based": total_row["busy"],
-            "per_core": [round(v, 1) for v in per_core],
-            "user": total_row["user"],
-            "privileged": total_row["system"],
-            "interrupt": total_row["irq"],
-            # No Windows equivalents -- new signals, both explain "slow but not
-            # busy": iowait is CPU idle *waiting on disk*, steal is the
-            # hypervisor giving this VM's time to someone else.
-            "iowait": total_row["iowait"],
-            "steal": total_row["steal"],
-            "performance_pct": None,
-            "frequency_mhz": _current_mhz(),
-            "governor": linux.read_line(
-                "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-            "thermal": self._thermal(elapsed),
-            "queue_length": queue,
-            "queue_per_core": (None if queue is None
-                               else round(queue / logical, 2)),
-            "blocked": stat.get("procs_blocked"),
-            "load_1": load1, "load_5": load5, "load_15": load15,
-            "context_switches": None if ctxt is None else round(ctxt),
-            "system_calls": None,  # no such system-wide counter on Linux
-            "logical_cores": logical,
-            "process_count": _count_pids(),
-            "thread_count": thread_count,
-        }
-
-    def _thermal(self, elapsed: float) -> dict[str, object]:
-        """Thermal / power-limit throttling: the CPU being slowed by its own
-        cooling, which no process can be blamed for. The counters are
-        cumulative throttle events per core; their rate is the signal. The
-        clock ratio (current vs. maximum cpufreq) is the second view of the
-        same thing, where cpufreq exists."""
-        max_khz = linux.read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
-        cur_khz = linux.read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
-        ratio = (round(cur_khz / max_khz, 3) if max_khz and cur_khz else None)
-        if not self._throttle_paths:
-            return {
-                "available": False,
-                "reason": ("no thermal_throttle counters in sysfs -- a virtual "
-                           "machine, or a platform whose CPU driver does not "
-                           "expose them; throttling cannot be observed here"),
-                "throttle_events_sec": None, "throttle_count": None,
-                "clock_ratio": ratio, "max_mhz": (max_khz or 0) / 1000 or None,
-            }
-        total = 0
-        for path in self._throttle_paths:
-            total += linux.read_int(path) or 0
-        rate = None
-        if self._prev_throttle is not None:
-            rate = max(0.0, (total - self._prev_throttle[1]) / elapsed)
-        self._prev_throttle = (time.monotonic(), total)
-        return {
-            "available": True, "reason": None,
-            "throttle_events_sec": None if rate is None else round(rate, 2),
-            "throttle_count": total,
-            "clock_ratio": ratio, "max_mhz": (max_khz or 0) / 1000 or None,
-        }
-
-    # --------------------------------------------------------------- memory
-    def _memory_section(self, vmstat: dict, prev: dict, elapsed: float) -> dict:
-        info = linux.parse_kv_file("/proc/meminfo")
-        total = linux.meminfo_kb(info, "MemTotal") or 0
-        # MemAvailable, not MemFree: free ignores reclaimable page cache and
-        # under-reports what is actually usable by a wide margin.
-        available = linux.meminfo_kb(info, "MemAvailable")
-        committed = linux.meminfo_kb(info, "Committed_AS")
-        commit_limit = linux.meminfo_kb(info, "CommitLimit")
-        cached = ((linux.meminfo_kb(info, "Cached") or 0)
-                  + (linux.meminfo_kb(info, "SReclaimable") or 0))
-        swap_total = linux.meminfo_kb(info, "SwapTotal") or 0
-        swap_free = linux.meminfo_kb(info, "SwapFree") or 0
-        swap_used = max(0, swap_total - swap_free)
-        used = total - (available or 0)
-
-        # Commit charge maps 1:1 to Windows *only* under strict overcommit
-        # (vm.overcommit_memory=2). Under the default heuristic policy the
-        # kernel does not enforce CommitLimit and Committed_AS routinely
-        # exceeds it on a healthy machine -- treating that as "allocations
-        # about to fail" would be confident nonsense, so the enforcement flag
-        # travels with the numbers and the Lag Doctor gates on it.
-        overcommit = linux.read_int("/proc/sys/vm/overcommit_memory")
-
-        # pgmajfault is the honest "memory is being served from disk" rate --
-        # the direct analogue of Windows' hard faults, and the number that
-        # explains stutter.
-        majflt = _rate_of(vmstat, prev, "pgmajfault", elapsed)
-        minflt = _rate_of(vmstat, prev, "pgfault", elapsed)
-        swap_in = _rate_of(vmstat, prev, "pswpin", elapsed)
-        swap_out = _rate_of(vmstat, prev, "pswpout", elapsed)
-        # Which devices back swap, and whether any is a spinning disk: paging
-        # to rotational storage costs a seek per page, which is the case
-        # where "swapping" is a hardware verdict rather than a process's fault.
-        # /proc/swaps changes on swapon/swapoff only, so a minute is plenty.
         now = time.monotonic()
-        if now - self._swap_checked > 60.0:
-            self._swap_devices = _swap_devices()
+        if now - self._swap_checked > 300:
+            self._swap_devices = _pagefiles()
             self._swap_checked = now
-        rotational_flags = [d.get("rotational") for d in self._swap_devices]
 
-        return {
-            "total": total,
-            "used": used,
-            "available": available,
-            "percent": round(clamp(safe_div(used, total) * 100), 2) if total else None,
-            "available_mb": (None if available is None
-                             else round(available / 1048576)),
-            # Committed_AS / CommitLimit is a clean 1:1 with Windows commit
-            # charge. Note the limit depends on vm.overcommit_* settings.
-            "committed": committed,
-            "commit_limit": commit_limit,
-            "commit_percent": (
-                round(clamp(safe_div(committed or 0, commit_limit or 0) * 100), 2)
-                if committed and commit_limit else None
+        cpu = {
+            "total": round(total, 2),
+            "total_time_based": round(clamp(psutil_total), 2),
+            "per_core": [round(v, 1) for v in per_core],
+            "user": _round(query.value("cpu_user"), fallback=times.user),
+            "privileged": _round(query.value("cpu_privileged"),
+                                 fallback=times.system),
+            "interrupt": _round(interrupt_total),
+            "dpc": _round(dpc),
+            # No Linux-only kernel counters on Windows -- None, never 0.
+            "iowait": None,
+            "steal": None,
+            # >100% means turbo; do not clamp, it is real information.
+            "performance_pct": _round(query.value("cpu_performance")),
+            "frequency_mhz": _round(query.value("cpu_frequency"), digits=0),
+            "governor": _power_plan(),
+            "thermal": self._thermal(),
+            "queue_length": _round(queue, digits=2),
+            "queue_per_core": _round(safe_div(queue or 0.0, logical), digits=2),
+            "blocked": None,
+            "load_1": None, "load_5": None, "load_15": None,
+            "context_switches": _round(query.value("context_switches"), digits=0),
+            "system_calls": _round(query.value("system_calls"), digits=0),
+            "logical_cores": logical,
+            "process_count": _round(query.value("processes"), digits=0),
+            "thread_count": _round(query.value("threads"), digits=0),
+        }
+        pages_in = query.value("pages_in")
+        pages_out = query.value("pages_out")
+        memory = {
+            "total": virtual.total,
+            "used": virtual.total - virtual.available,
+            "available": virtual.available,
+            "percent": round(virtual.percent, 2),
+            "available_mb": _round(query.value("mem_available_mb"), digits=0)
+                            or round(virtual.available / 1048576),
+            "committed": _int(committed),
+            "commit_limit": _int(commit_limit),
+            "commit_percent": round(
+                clamp(safe_div((committed or 0.0), (commit_limit or 0.0)) * 100), 2
             ),
-            "commit_enforced": overcommit == 2,
-            "overcommit_policy": overcommit,
-            "cached": cached or None,
-            "hard_faults_sec": None if majflt is None else round(majflt, 1),
-            "page_faults_sec": None if minflt is None else round(minflt),
-            "swap_total": swap_total,
-            "swap_used": swap_used,
-            "swap_percent": (round(safe_div(swap_used, swap_total) * 100, 2)
-                             if swap_total else 0.0),
-            "swap_in_sec": None if swap_in is None else round(swap_in, 1),
-            "swap_out_sec": None if swap_out is None else round(swap_out, 1),
+            # Windows always enforces the commit limit: an allocation past it
+            # fails outright, so commit% is a real ceiling here (on Linux it
+            # only is under vm.overcommit_memory=2).
+            "commit_enforced": True,
+            "overcommit_policy": None,
+            "cached": _int(query.value("mem_cache")),
+            "pool_paged": _int(query.value("pool_paged")),
+            "pool_nonpaged": _int(query.value("pool_nonpaged")),
+            # Hard faults resolved from disk. The number that explains stutter.
+            "hard_faults_sec": _round(query.value("hard_faults"), digits=1),
+            "page_faults_sec": _round(query.value("page_faults"), digits=0),
+            "swap_total": swap.total,
+            "swap_used": swap.used,
+            "swap_percent": round(swap.percent, 2),
+            # Pages Input/Output are page-sized; Linux reports pages too.
+            "swap_in_sec": _round(pages_in, digits=1),
+            "swap_out_sec": _round(pages_out, digits=1),
             "swap_devices": self._swap_devices,
-            # True if any swap device spins; None when there is no swap or the
-            # device type could not be read (never a guessed False).
-            "swap_rotational": (True if any(f is True for f in rotational_flags)
-                                else False if rotational_flags
-                                and all(f is False for f in rotational_flags)
-                                else None),
-            # Cumulative OOM kills since boot; the sampler diffs it for alerts.
-            "oom_kills_total": vmstat.get("oom_kill"),
-            "dirty": linux.meminfo_kb(info, "Dirty"),
-            "writeback": linux.meminfo_kb(info, "Writeback"),
+            "swap_rotational": next((d.get("rotational") for d in self._swap_devices
+                                     if d.get("rotational") is not None), None),
+            "pagefile_percent": _round(query.value("pagefile_usage"), digits=2),
+            "oom_kills_total": None,
+            "dirty": _pages_to_bytes(query.value("dirty_pages")),
+            "writeback": None,
+        }
+        return {"cpu": cpu, "memory": memory, "psi": None}
+
+    def _thermal(self) -> dict[str, object]:
+        if not self.has_thermal:
+            return {"available": False,
+                    "reason": self.query.unavailable.get(
+                        "thermal_temp", "no Thermal Zone Information counters on this machine"),
+                    "throttle_events_sec": None, "throttle_count": None,
+                    "clock_ratio": None, "max_mhz": None, "temperature_c": None}
+        temps = [v for v in self.query.array("thermal_temp").values() if v > 0]
+        limits = [v for v in self.query.array("thermal_limit").values()]
+        performance = self.query.value("cpu_performance")
+        return {
+            "available": bool(temps),
+            "reason": None if temps else "the Thermal Zone counters report no temperature",
+            # Passive limit < 100 means the firmware is asking for less clock:
+            # that is the throttle, reported as the ratio Linux would show.
+            "throttle_events_sec": None,
+            "throttle_count": None,
+            "clock_ratio": (round(min(limits) / 100.0, 3) if limits
+                            else (round(performance / 100.0, 3) if performance else None)),
+            "max_mhz": None,
+            "temperature_c": round(max(temps) - 273.15, 1) if temps else None,
         }
 
-    def close(self) -> None:  # symmetry with the sampler's lifecycle hooks
-        pass
+    def close(self) -> None:
+        self.query.close()
 
 
-# ------------------------------------------------------------------- /proc/stat
-def _read_proc_stat() -> dict[str, object]:
-    """Per-CPU jiffy rows plus the scalar counters, one pass."""
-    out: dict[str, object] = {}
-    text = linux.read_text("/proc/stat") or ""
-    for line in text.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        key = parts[0]
-        if key.startswith("cpu"):
-            try:
-                out[key] = [int(v) for v in parts[1:]]
-            except ValueError:
-                pass
-        elif key in ("ctxt", "procs_running", "procs_blocked", "btime"):
-            try:
-                out[key] = int(parts[1])
-            except (ValueError, IndexError):
-                pass
-    return out
-
-
-def _cpu_percent(row: list[int] | None, prev: list[int] | None) -> dict[str, float | None]:
-    """Deltas of one jiffy row -> percentages of that CPU's time."""
-    empty = {"busy": 0.0, "user": None, "system": None, "irq": None,
-             "iowait": None, "steal": None}
-    if not row or not prev or len(row) < 8 or len(prev) < 8:
-        return empty
-    delta = [max(0, a - b) for a, b in zip(row, prev)]
-    total = sum(delta[:8])  # user nice system idle iowait irq softirq steal
-    if total <= 0:
-        return empty
-    user, nice, system, idle, iowait, irq, softirq, steal = delta[:8]
-    pct = lambda v: round(100.0 * v / total, 2)  # noqa: E731
-    return {
-        # iowait is idle-while-waiting, so it is not "busy" -- a machine at 5%
-        # busy + 60% iowait is idle CPU-wise and drowning IO-wise, and the two
-        # must not be conflated.
-        "busy": pct(total - idle - iowait),
-        "user": pct(user + nice),
-        "system": pct(system),
-        "irq": pct(irq + softirq),
-        "iowait": pct(iowait),
-        "steal": pct(steal),
-    }
-
-
-_VMSTAT_KEYS = frozenset(
-    {"pgmajfault", "pgfault", "pswpin", "pswpout", "oom_kill"})
-
-
-def _read_vmstat() -> dict[str, int]:
-    out: dict[str, int] = {}
-    text = linux.read_text("/proc/vmstat") or ""
-    for line in text.splitlines():
-        key, _, value = line.partition(" ")
-        if key in _VMSTAT_KEYS:
-            try:
-                out[key] = int(value)
-            except ValueError:
-                pass
-    return out
-
-
-def _rate_of(current: dict, prev: dict, key: str, elapsed: float) -> float | None:
-    now_v, prev_v = current.get(key), (prev or {}).get(key)
-    if now_v is None or prev_v is None:
-        return None
-    return max(0.0, (now_v - prev_v) / elapsed)
-
-
-def _count_pids() -> int:
-    try:
-        return sum(1 for name in os.listdir("/proc") if name.isdigit())
-    except OSError:
-        return 0
-
-
-def _throttle_counter_paths() -> list[str]:
-    base = "/sys/devices/system/cpu"
-    out: list[str] = []
-    try:
-        for entry in os.listdir(base):
-            if not (entry.startswith("cpu") and entry[3:].isdigit()):
-                continue
-            for name in ("core_throttle_count", "package_throttle_count"):
-                path = f"{base}/{entry}/thermal_throttle/{name}"
-                if os.path.exists(path):
-                    out.append(path)
-    except OSError:
-        pass
-    return out
-
-
-def _swap_devices() -> list[dict[str, object]]:
-    """Every active swap area with the rotational flag of the disk under it.
-
-    A swap *file* is resolved through the filesystem it lives on (st_dev), a
-    partition through its device node (st_rdev); dm/md devices are followed
-    down through /sys/dev/block/<maj:min>/slaves to a real disk. Anything
-    that cannot be resolved reports rotational=None.
-    """
-    text = linux.read_text("/proc/swaps")
+def _pagefiles() -> list[dict[str, object]]:
+    """The page files in the Linux `swap_devices` shape (path/type/size_kb/
+    rotational). Rotational comes from the drive behind the file's letter
+    when WMI can say; None when it cannot."""
     out: list[dict[str, object]] = []
-    if not text:
-        return out
-    for line in text.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        path, kind = parts[0], parts[1]
-        try:
-            size_kb = int(parts[2])
-        except ValueError:
-            size_kb = None
-        rotational: bool | None = None
-        try:
-            st = os.stat(path)
-            dev = st.st_rdev if kind == "partition" and st.st_rdev else st.st_dev
-            rotational = _rotational_of(os.major(dev), os.minor(dev))
-        except OSError:
-            pass
-        out.append({"path": path, "type": kind, "size_kb": size_kb,
-                    "rotational": rotational})
+    rows = windows.wmi_query(
+        "SELECT Name, AllocatedBaseSize, CurrentUsage FROM Win32_PageFileUsage",
+        ("Name", "AllocatedBaseSize", "CurrentUsage"))
+    media = _media_by_letter() if rows else {}
+    for row in rows:
+        path = str(row.get("Name") or "")
+        letter = path[:2].upper() if len(path) >= 2 and path[1] == ":" else None
+        size_mb = row.get("AllocatedBaseSize")
+        out.append({
+            "path": path, "type": "file",
+            "size_kb": int(size_mb) * 1024 if isinstance(size_mb, (int, float)) else None,
+            "rotational": media.get(letter) if letter else None,
+        })
     return out
 
 
-def _rotational_of(major: int, minor: int, depth: int = 0) -> bool | None:
-    """queue/rotational for a block device, following partitions up to their
-    disk and layered (dm/md) devices down to their slaves."""
-    if depth > 4:
-        return None
-    try:
-        node = os.path.realpath(f"/sys/dev/block/{major}:{minor}")
-    except OSError:
-        return None
-    if not os.path.isdir(node):
-        return None
-    # A partition directory has a `partition` file; its disk is the parent.
-    if os.path.exists(f"{node}/partition"):
-        node = os.path.dirname(node)
-    try:
-        slaves = os.listdir(f"{node}/slaves")
-    except OSError:
-        slaves = []
-    if slaves:
-        flags = []
-        for slave in slaves:
-            dev = linux.read_line(f"{node}/slaves/{slave}/dev")
-            if dev and ":" in dev:
-                maj, _, mino = dev.partition(":")
-                try:
-                    flags.append(_rotational_of(int(maj), int(mino), depth + 1))
-                except ValueError:
-                    pass
-        if any(f is True for f in flags):
-            return True
-        if flags and all(f is False for f in flags):
-            return False
-        return None
-    value = linux.read_int(f"{node}/queue/rotational")
-    return None if value is None else bool(value)
+def _media_by_letter() -> dict[str, bool | None]:
+    """Drive letter -> rotational, via the Storage namespace (Windows 8+)."""
+    out: dict[str, bool | None] = {}
+    disks = windows.wmi_query(
+        "SELECT DeviceId, MediaType FROM MSFT_PhysicalDisk",
+        ("DeviceId", "MediaType"), namespace=r"winmgmts:\\.\root\Microsoft\Windows\Storage")
+    if not disks:
+        return out
+    rotational_by_index = {str(d.get("DeviceId")): media_rotational(d.get("MediaType"))
+                           for d in disks}
+    # Letter -> disk index through the partition associations.
+    for row in windows.wmi_query(
+            "SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition",
+            ("Antecedent", "Dependent")):
+        antecedent = str(row.get("Antecedent") or "")
+        dependent = str(row.get("Dependent") or "")
+        # 'Win32_DiskPartition.DeviceID="Disk #0, Partition #2"' / '...DeviceID="C:"'
+        index = antecedent.split("Disk #", 1)[-1].split(",", 1)[0].strip('" ')
+        letter = dependent.rsplit("=", 1)[-1].strip('"').upper()
+        if index.isdigit() and len(letter) == 2:
+            out[letter] = rotational_by_index.get(index)
+    return out
 
 
-def _current_mhz() -> float | None:
-    """Average current frequency. cpufreq is authoritative; /proc/cpuinfo is
-    the fallback (the only source inside this KVM dev box, where cpufreq does
-    not exist at all)."""
-    freqs: list[float] = []
-    base = "/sys/devices/system/cpu"
+def media_rotational(media_type: object) -> bool | None:
+    """MSFT_PhysicalDisk.MediaType: 0 unspecified, 3 HDD, 4 SSD, 5 SCM."""
     try:
-        for entry in os.listdir(base):
-            if not (entry.startswith("cpu") and entry[3:].isdigit()):
-                continue
-            khz = linux.read_int(f"{base}/{entry}/cpufreq/scaling_cur_freq")
-            if khz:
-                freqs.append(khz / 1000.0)
-    except OSError:
-        pass
-    if not freqs:
-        text = linux.read_text("/proc/cpuinfo") or ""
-        for line in text.splitlines():
-            if line.startswith("cpu MHz"):
-                try:
-                    freqs.append(float(line.split(":")[1]))
-                except (IndexError, ValueError):
-                    pass
-    return round(sum(freqs) / len(freqs)) if freqs else None
+        value = int(media_type)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return {3: True, 4: False, 5: False}.get(value)
+
+
+_power_plan_cache: tuple[float, str | None] = (0.0, None)
+
+
+def _power_plan() -> str | None:
+    """The active power scheme, the Windows counterpart of the cpufreq
+    governor: 'power saver' on battery explains a lot of reported slowness.
+    Read from the registry every minute -- no powercfg spawn on the 1 Hz path."""
+    global _power_plan_cache
+    now = time.monotonic()
+    if now - _power_plan_cache[0] < 60:
+        return _power_plan_cache[1]
+    name = None
+    guid = windows.reg_value(
+        windows.HKLM, r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes",
+        "ActivePowerScheme")
+    if guid:
+        friendly = windows.reg_value(
+            windows.HKLM,
+            rf"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\{guid}",
+            "FriendlyName")
+        # The built-in schemes store an indirect string ("@%SystemRoot%\...,-13")
+        # rather than the name; map the well-known GUIDs instead.
+        known = {
+            "381b4222-f694-41f0-9685-ff5bb260df2e": "balanced",
+            "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c": "high performance",
+            "a1841308-3541-4fab-bc81-f71556f20b4a": "power saver",
+            "e9a42b02-d5df-448d-aa00-03f14749eb61": "ultimate performance",
+        }
+        name = known.get(str(guid).lower()) or (
+            str(friendly) if friendly and not str(friendly).startswith("@") else str(guid))
+    _power_plan_cache = (now, name)
+    return name
+
+
+def _core_sort_key(name: str) -> tuple[int, int]:
+    """'0,5' -> (0, 5); '5' -> (0, 5). Keeps cores in hardware order."""
+    try:
+        if "," in name:
+            group, core = name.split(",", 1)
+            return int(group), int(core)
+        return 0, int(name)
+    except ValueError:
+        return 999, 999
+
+
+def _round(value: float | None, digits: int = 2,
+           fallback: float | None = None) -> float | None:
+    if value is None:
+        value = fallback
+    if value is None:
+        return None
+    return round(float(value), digits) if digits else round(float(value))
+
+
+def _int(value: float | None) -> int | None:
+    return None if value is None else int(value)
+
+
+def _pages_to_bytes(pages: float | None) -> int | None:
+    return None if pages is None else int(pages) * 4096
