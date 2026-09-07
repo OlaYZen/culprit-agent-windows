@@ -2,19 +2,19 @@
 
 Why four loops and not one:
 
-    fast   (1s)    cpu, memory, psi, gpu, disk rate, net rate  ~1-2ms
-    proc   (2s)    the process table + lag scoring             ~15-30ms
-    slow   (20s)   systemd units, mounts, network, sync        ~100-400ms
-    events (120s)  journal, crash files, pending reboot        ~1-3s
+    fast   (1s)    cpu, memory, gpu, disk rate, net rate       ~25ms (PDH)
+    proc   (2s)    the process table + lag scoring             ~75-120ms
+    slow   (20s)   services, volumes, adapters, OneDrive       ~400ms
+    events (120s)  event log, minidumps, pending reboot        ~2s
 
 Polling a 200-unit systemd table or a 30-day journal window at 1Hz would burn
 real CPU to re-answer questions whose answers change on a scale of minutes. A
 monitoring tool that is itself a top-five process has failed at its job.
 
-Collectors block (file IO, subprocesses), so each loop runs its work in a
-**single-threaded** executor of its own: one slow tier can never starve
-another. (The Windows build also needed this for COM/PDH thread affinity;
-that constraint is gone, the isolation argument stays.)
+Every collector is blocking (psutil, PDH, WMI, the event log), so each loop
+runs its work in a **single-threaded** executor of its own. Single-threaded
+matters twice here: COM apartment state and PDH query handles stay on one
+consistent thread per tier, and one slow tier can never starve another.
 
 Loops are self-correcting rather than `sleep(interval)`: the next wake-up is
 computed from the deadline, so a 400ms collection inside a 1s tick still yields
@@ -68,11 +68,11 @@ LIVE_KEYS: tuple[str, ...] = (
 # shows these instead of a bare spinner.
 WARMUP_STAGES: tuple[str, ...] = (
     "Reading machine identity",
-    "Probing GPU backends",
+    "Opening performance counters",
     "Reading the process table",
     "Establishing rate baselines",
-    "Querying systemd units and mounts",
-    "Reading the journal (slow on first run)",
+    "Querying services and volumes",
+    "Reading the Windows event log",
     "Almost done",
 )
 
@@ -254,6 +254,11 @@ class Sampler:
             "fast": cfg.interval_fast, "proc": cfg.interval_proc,
             "slow": cfg.interval_slow, "events": cfg.interval_events,
         }[name]
+        if name == "proc" and self.proc is not None and \
+                getattr(self.proc, "mode", "pdh") == "psutil":
+            # The psutil fallback costs seconds per scan rather than ~100ms, so
+            # a 2s cadence would leave the executor permanently saturated.
+            interval = max(interval, 15.0)
         return interval
 
     # -------------------------------------------------------------- fast tick

@@ -28,7 +28,6 @@ import gzip
 import json
 import logging
 import os
-import pwd
 import shutil
 import signal
 import ssl
@@ -51,40 +50,46 @@ log = logging.getLogger("culprit.agent")
 
 
 # ------------------------------------------------------------------ paths
-# Nothing the agent writes lives in the checkout. It used to (agent.json,
-# .venv, data/), and under sudo that left root-owned files in a directory the
-# person who cloned it still wanted to `git pull`. So the config and the
-# flight recorder live in the running user's XDG directories -- root's own
-# when the service runs as root -- and the checkout is only ever read:
+# Nothing the agent writes lives in the checkout, so `git pull` (and the
+# self-update, which is a git reset) keeps working. The config and the
+# flight recorder live in the running account's profile:
 #
-#   config     $XDG_CONFIG_HOME/culprit-agent/agent.json   (~/.config/...)
-#   recorder   $XDG_DATA_HOME/culprit-agent/flight-recorder.json.gz  (~/.local/share/...)
+#   config     %APPDATA%\culprit-agent\agent.json
+#   recorder   %LOCALAPPDATA%\culprit-agent\flight-recorder.json.gz
 #
-# The home is the effective user's from the password database, not $HOME:
-# under sudo and under a system unit both must resolve to the same place.
-# CULPRIT_AGENT_CONFIG / CULPRIT_AGENT_DATA override either (the generated
-# unit sets them, so the service and `agent.sh --configure` always agree).
-def _home() -> Path:
-    try:
-        return Path(pwd.getpwuid(os.geteuid()).pw_dir)
-    except (KeyError, OSError):
-        return Path.home()
+# A scheduled task running as SYSTEM has a profile too (under
+# C:\Windows\System32\config\systemprofile), but agent.ps1 installs that task
+# with explicit --config / --data arguments pointing at %ProgramData%, so the
+# installer (run by an administrator) and the task (run as SYSTEM) agree on
+# the same files. CULPRIT_AGENT_CONFIG / CULPRIT_AGENT_DATA override either
+# for the Linux-style environment route.
+_CLI_CONFIG: Path | None = None
+_CLI_DATA: Path | None = None
+
+
+def _profile(var: str, fallback: str) -> Path:
+    base = os.environ.get(var)
+    if base:
+        return Path(base)
+    return Path.home() / fallback
 
 
 def config_path() -> Path:
+    if _CLI_CONFIG is not None:
+        return _CLI_CONFIG
     override = os.environ.get("CULPRIT_AGENT_CONFIG")
     if override:
         return Path(override)
-    base = os.environ.get("XDG_CONFIG_HOME") or (_home() / ".config")
-    return Path(base) / "culprit-agent" / "agent.json"
+    return _profile("APPDATA", "AppData/Roaming") / "culprit-agent" / "agent.json"
 
 
 def data_dir() -> Path:
+    if _CLI_DATA is not None:
+        return _CLI_DATA
     override = os.environ.get("CULPRIT_AGENT_DATA")
     if override:
         return Path(override)
-    base = os.environ.get("XDG_DATA_HOME") or (_home() / ".local" / "share")
-    return Path(base) / "culprit-agent"
+    return _profile("LOCALAPPDATA", "AppData/Local") / "culprit-agent"
 
 
 CONFIG_PATH = config_path()
@@ -143,8 +148,9 @@ def migrate_legacy_files() -> None:
     _migrate(LEGACY_RECORDER_PATH, RECORDER_PATH, 0o600)
 
 
-def load_agent_config(path: Path = CONFIG_PATH) -> dict:
+def load_agent_config(path: Path | None = None) -> dict:
     cfg = dict(_DEFAULTS)
+    path = path or CONFIG_PATH
     if path == CONFIG_PATH:
         _migrate(LEGACY_CONFIG_PATH, path, 0o600)
     if path.exists():
@@ -156,10 +162,14 @@ def load_agent_config(path: Path = CONFIG_PATH) -> dict:
     return cfg
 
 
-def save_agent_config(cfg: dict, path: Path = CONFIG_PATH) -> None:
+def save_agent_config(cfg: dict, path: Path | None = None) -> None:
+    path = path or CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(cfg, indent=2) + "\n")
-    os.chmod(path, 0o600)  # the token lives in here
+    # The token lives in here. chmod is a no-op for NTFS ACLs; the file
+    # inherits the profile folder's ACL (the user, SYSTEM and Administrators),
+    # and agent.ps1 tightens %ProgramData%\culprit-agent the same way.
+    os.chmod(path, 0o600)
 
 
 class Reporter:
@@ -254,6 +264,10 @@ class Reporter:
             "agent": {
                 "name": self.node_name,
                 "version": __version__,
+                # Which agent this is. The host picks the version feed, the
+                # Patch notes mirror and the dashboard's vocabulary by it;
+                # an old host ignores the key.
+                "platform": "windows",
                 "report_interval": self.interval,
                 "interval_fast": config_module.get().interval_fast,
                 "update_capable": self._update_capable,
@@ -475,11 +489,13 @@ async def run_agent(cfg: dict) -> int:
     loop = asyncio.get_running_loop()
     reporter.loop = loop
     reporter.stopping = stopping
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stopping.set)
-        except NotImplementedError:
-            pass
+    # asyncio's add_signal_handler is not implemented on Windows, so the
+    # plain signal module does the job: Ctrl+C (SIGINT), Ctrl+Break
+    # (SIGBREAK) and the console-close / task-end that Windows delivers as
+    # SIGTERM to a Python process all set the stopping event from the
+    # handler thread -- so the sampler still marks a clean stop and the
+    # Coroner never mistakes a routine restart for a death.
+    _install_stop_signals(loop, stopping)
 
     try:
         while not stopping.is_set():
@@ -492,6 +508,26 @@ async def run_agent(cfg: dict) -> int:
         await sampler.stop()
     log.info("agent stopped")
     return 0
+
+
+def _install_stop_signals(loop: asyncio.AbstractEventLoop, stopping: asyncio.Event) -> None:
+    def _stop(signum, _frame):  # type: ignore[no-untyped-def]
+        log.info("stop signal %s received", signum)
+        loop.call_soon_threadsafe(stopping.set)
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, stopping.set)
+            continue
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -508,7 +544,28 @@ def main(argv: list[str] | None = None) -> int:
                         help="do not verify the host's TLS certificate")
     parser.add_argument("--log-level", default="info",
                         choices=("debug", "info", "warning", "error"))
+    parser.add_argument("--config", help="path of agent.json (default: "
+                        "%%APPDATA%%\\culprit-agent\\agent.json)")
+    parser.add_argument("--data", help="directory for the flight recorder "
+                        "(default: %%LOCALAPPDATA%%\\culprit-agent)")
+    parser.add_argument("--managed", action="store_true",
+                        help="started by the scheduled task agent.ps1 installed "
+                             "(something restarts it on exit, so remote updates "
+                             "are allowed)")
     args = parser.parse_args(argv)
+
+    global CONFIG_PATH, RECORDER_PATH, _CLI_CONFIG, _CLI_DATA
+    if args.config:
+        _CLI_CONFIG = Path(args.config)
+        CONFIG_PATH = _CLI_CONFIG
+    if args.data:
+        _CLI_DATA = Path(args.data)
+        RECORDER_PATH = _CLI_DATA / "flight-recorder.json.gz"
+    if args.managed:
+        # The updater reads this the way the Linux agent reads systemd's
+        # INVOCATION_ID: proof that something brings the process back up.
+        os.environ["CULPRIT_AGENT_MANAGED"] = "1"
+        os.environ.setdefault("CULPRIT_AGENT_TASK", "culprit-agent")
 
     logging.basicConfig(
         level=args.log_level.upper(),
@@ -516,7 +573,7 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
 
-    cfg = load_agent_config()
+    cfg = load_agent_config(CONFIG_PATH)
     changed = False
     if args.host:
         cfg["host_url"] = args.host
@@ -536,7 +593,7 @@ def main(argv: list[str] | None = None) -> int:
                      "(get a token on the host with: "
                      "python -m culprit agents add <name>)")
     if changed:
-        save_agent_config(cfg)
+        save_agent_config(cfg, CONFIG_PATH)
         log.info("saved %s", CONFIG_PATH)
 
     return asyncio.run(run_agent(cfg))

@@ -130,11 +130,12 @@ def current_branch() -> str:
 def capability() -> tuple[bool, str | None]:
     """(capable, reason) -- every blocker is named exactly, never silent."""
     if os.environ.get("CULPRIT_AGENT_DOCKER"):
-        return False, "running in the Docker image; rebuild/pull the image instead"
+        return False, "running in a container image; rebuild/pull the image instead"
     if not config_module.get().allow_remote_update:
         return False, "remote updates disabled on this agent (allow_remote_update is false)"
-    if not os.environ.get("INVOCATION_ID"):
-        return False, "not running under systemd (started via --run); nothing would bring it back up"
+    if not os.environ.get("CULPRIT_AGENT_MANAGED"):
+        return False, ("not started by the scheduled task (started via --run); "
+                       "nothing would bring it back up after the restart")
     if not (config_module.ROOT / ".git").is_dir():
         return False, "checkout has no .git (deployed with cp -r, not git clone)"
     ok, out = _git("remote", "get-url", "origin", timeout=10)
