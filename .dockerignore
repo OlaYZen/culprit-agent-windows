@@ -1,0 +1,13 @@
+# Keep the build context tiny and never ship secrets or local state into the image.
+.git
+.github
+.venv
+agent.json
+config.json
+**/__pycache__
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+docker-compose.yml
+*.md

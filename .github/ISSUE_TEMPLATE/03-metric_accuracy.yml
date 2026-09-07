@@ -1,0 +1,62 @@
+name: Incorrect or missing metric
+description: A number from this agent looks wrong, or a source reads "unavailable" when you think it should work.
+title: "[Data]: "
+labels: ["data-accuracy", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The agent runs the same collectors as the host, so a metric should match
+        ground truth. If it does not, compare against a standard tool so we can
+        see the gap.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+  - type: dropdown
+    id: view
+    attributes:
+      label: Which view or metric?
+      options:
+        - Processor / CPU
+        - Memory
+        - Pressure (PSI)
+        - GPU / Graphics
+        - Disk
+        - Network / Ports
+        - Processes / Lag Doctor
+        - Services (systemd units)
+        - Events
+        - Sessions
+        - Sync
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: What it shows vs. ground truth
+      description: |
+        What the agent reports, and what you believe is correct, with the output
+        of a standard tool for comparison (for example `top`, `iostat -x`,
+        `free -m`, `systemctl status`, `ss -tulpn`, `cat /proc/pressure/*`).
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and kernel
+      placeholder: e.g. Ubuntu 24.04, kernel 6.8
+    validations:
+      required: true
+  - type: checkboxes
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - label: This machine is a container or VM (not bare metal)
+        - label: The agent runs as root or with extra capabilities (SYS_PTRACE)
+        - label: The kernel has PSI (`/proc/pressure` exists)

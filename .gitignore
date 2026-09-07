@@ -1,0 +1,30 @@
+# Virtual environment — recreated by agent.sh on the target
+.venv/
+
+# Agent credentials — host URL + bearer token, written by agent.sh. Never commit.
+agent.json
+
+# Docker env files hold the token — commit only .env.example.
+.env
+stack.env
+
+# The agent keeps no database, but never commit one if it appears
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# The flight recorder (data/flight-recorder.json.gz): runtime state, per machine
+data/

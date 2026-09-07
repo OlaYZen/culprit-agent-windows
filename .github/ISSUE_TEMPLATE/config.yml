@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/OlaYZen/culprit/security/advisories/new
+    about: Please report security issues privately, never in a public issue. Security is handled in the main culprit repository.
+  - name: Host / dashboard issues
+    url: https://github.com/OlaYZen/culprit/issues/new/choose
+    about: Problems with the dashboard, API, or auth belong in the main culprit repository.
+  - name: Read the agent docs
+    url: https://github.com/OlaYZen/culprit-agent#readme
+    about: Deploy (native, systemd, Docker), the flags and mounts, and NVIDIA GPU setup are all in the README.

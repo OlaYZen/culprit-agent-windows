@@ -1,0 +1,40 @@
+# culprit agent -- systemd SYSTEM unit, runs as ROOT.
+#
+# Use this instead of the *user* unit (culprit-agent.service) when you want full
+# port/process attribution: reading another user's /proc/<pid>/fd -- which is
+# what maps a listening port to its process -- needs root or CAP_SYS_PTRACE.
+#
+# `sudo ./agent.sh` writes and enables an equivalent of this unit with the
+# folder's real path; this file is the manual alternative (adjust the path if
+# your bundle isn't at /opt/culprit-agent):
+#   sudo cp -r culprit-agent /opt/culprit-agent
+#   cd /opt/culprit-agent
+#   sudo ./agent.sh --configure             # builds root's venv, asks for host + token, writes /root/.config/culprit-agent/agent.json (chmod 600)
+#   sudo cp culprit-agent.system.service /etc/systemd/system/culprit-agent.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now culprit-agent
+#   sudo systemctl status culprit-agent
+
+[Unit]
+Description=culprit monitoring agent (reports to the host node, runs as root)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/culprit-agent
+Environment=CULPRIT_AGENT_CONFIG=/root/.config/culprit-agent/agent.json
+Environment=CULPRIT_AGENT_DATA=/root/.local/share/culprit-agent
+ExecStart=/root/.local/share/culprit-agent/venv/bin/python -m culprit.agent
+Restart=always
+RestartSec=10
+
+# --- Hardened alternative: run UNPRIVILEGED with just the two capabilities that
+# --- attribution needs, instead of full root. Comment out nothing above; just
+# --- add these two lines (and create the user: `sudo useradd -r -s /usr/sbin/nologin culprit`
+# --- then `sudo chown -R culprit: /opt/culprit-agent`):
+# User=culprit
+# AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

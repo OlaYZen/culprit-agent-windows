@@ -1,0 +1,32 @@
+# culprit agent -- systemd *user* unit for a report-only node.
+#
+# `./agent.sh` (without sudo) writes and enables an equivalent of this unit
+# with the folder's real path; this file is the manual alternative:
+#   cd ~/culprit-agent
+#   ./agent.sh --configure                 # asks for host + token, writes ~/.config/culprit-agent/agent.json
+#   mkdir -p ~/.config/systemd/user
+#   cp culprit-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now culprit-agent
+#   loginctl enable-linger $USER           # keep it running when you log out
+#
+# Assumes the bundle lives at ~/culprit-agent. If you put it elsewhere, edit the
+# two paths below. Runs unprivileged (run agent.sh with sudo for a root service
+# with full port/process attribution); it opens no listening ports.
+
+[Unit]
+Description=culprit monitoring agent (reports to the host node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/culprit-agent
+Environment=CULPRIT_AGENT_CONFIG=%h/.config/culprit-agent/agent.json
+Environment=CULPRIT_AGENT_DATA=%h/.local/share/culprit-agent
+ExecStart=%h/.local/share/culprit-agent/venv/bin/python -m culprit.agent
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,39 @@
+name: Question / help
+description: Ask how to deploy or configure the agent, or get help with a setup.
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Happy to help. Please check the README first; most deployment questions
+        (native, systemd, Docker, the flags and mounts, NVIDIA GPU) are answered
+        there.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you ask
+      options:
+        - label: I read the relevant part of the README.
+          required: true
+        - label: I searched existing issues.
+          required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What you are trying to do and where you are stuck.
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Commands you ran and what happened, with secrets redacted.
+      render: shell
+  - type: input
+    id: context
+    attributes:
+      label: Context
+      description: OS, and how the agent is deployed (native, systemd, or Docker).
+      placeholder: e.g. Debian 12, Docker via compose

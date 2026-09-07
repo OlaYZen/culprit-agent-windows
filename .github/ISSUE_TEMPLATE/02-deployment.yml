@@ -1,0 +1,89 @@
+name: Deployment / connectivity
+description: The agent will not connect or report, or a source is unavailable on the monitored node.
+title: "[Deploy]: "
+labels: ["deployment", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For getting the agent to connect, stay online, or read a source on a
+        watched machine (native, systemd, or Docker).
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: The agent and host are on the same version / latest image.
+          required: true
+  - type: dropdown
+    id: method
+    attributes:
+      label: How is the agent deployed?
+      options:
+        - Native, agent.sh as a normal user
+        - Native, agent.sh as root (sudo)
+        - systemd user service
+        - systemd system service (root)
+        - Docker (docker run / compose)
+        - TrueNAS SCALE or another managed container platform
+        - Other (describe below)
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom
+      options:
+        - Agent never appears in the host's Nodes list
+        - Agent appears, then goes stale / offline
+        - Token rejected (401 in the agent logs)
+        - TLS / certificate error
+        - A specific view reads "unavailable" (Services, Ports, GPU, Events, sessions)
+        - Reports arrive but a metric is wrong
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: describe
+    attributes:
+      label: Describe the problem
+      description: What you see on the dashboard and on the agent, and what you expected.
+    validations:
+      required: true
+  - type: input
+    id: reachability
+    attributes:
+      label: Can the agent reach the host?
+      description: Result of curling the host URL from the agent machine, e.g. `curl -sS -o /dev/null -w '%{http_code}' http://<host>:8787/`.
+      placeholder: e.g. 303, or "connection refused"
+  - type: textarea
+    id: run-command
+    attributes:
+      label: How you started it
+      description: The `agent.sh` line, the `docker run` command, or the systemd unit. Redact the token.
+      render: shell
+  - type: textarea
+    id: agent-logs
+    attributes:
+      label: Agent logs (debug)
+      description: With `CULPRIT_LOG_LEVEL=debug`, secrets redacted.
+      render: shell
+  - type: checkboxes
+    id: docker-flags
+    attributes:
+      label: If this is Docker, which flags are set?
+      description: Attribution needs the container to see the host. Tick what your command includes.
+      options:
+        - label: "`--pid host`"
+        - label: "`--network host`"
+        - label: "`--privileged` (or `--cap-add SYS_PTRACE --security-opt apparmor=unconfined`)"
+        - label: The host allows these (not a locked-down managed platform)
+  - type: input
+    id: os
+    attributes:
+      label: OS and kernel of the monitored machine
+      placeholder: e.g. Ubuntu 24.04, kernel 6.8
+    validations:
+      required: true

@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest an improvement to the agent, its packaging, or the Docker image.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. The agent aims to stay dependency-light (psutil plus
+        the standard library, no open ports) and to degrade honestly when a
+        source is missing. Note that new metrics usually belong in the main
+        culprit repository, since the package here is a synced copy.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched existing issues and did not find a duplicate request.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: The situation you are in and what makes it painful today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Deployment (agent.sh, systemd unit)
+        - Docker image / entrypoint
+        - Configuration / environment variables
+        - A collector or metric (may belong in the main repo)
+        - Other
+    validations:
+      required: true
