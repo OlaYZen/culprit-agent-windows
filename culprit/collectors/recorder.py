@@ -33,7 +33,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from .. import linux
+from .. import windows
 
 log = logging.getLogger("culprit.recorder")
 
@@ -60,9 +60,11 @@ FAST_COLUMNS: tuple[str, ...] = (
 
 
 def boot_id() -> str | None:
-    """The kernel's boot id: new on every boot, the one fact that separates
-    'the machine rebooted' from 'the agent restarted'."""
-    return linux.read_line("/proc/sys/kernel/random/boot_id")
+    """A token that changes on every boot: the one fact that separates 'the
+    machine rebooted' from 'the agent restarted'. Linux reads the kernel's
+    random boot id; Windows keeps no such file, so the boot time to the
+    second stands in (windows.boot_id) -- two boots cannot share one."""
+    return windows.boot_id()
 
 
 def _num(value: Any) -> float | None:

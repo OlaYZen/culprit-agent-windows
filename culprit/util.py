@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import functools
-import os
 import time
 from collections import deque
 from typing import Any, Deque, Iterable
@@ -125,17 +124,18 @@ class Sustain:
 
 @functools.lru_cache(maxsize=1)
 def is_elevated() -> bool:
-    """True when running as root.
+    """True when running as administrator (or SYSTEM).
 
-    Linux privilege is granular (groups, capabilities), so most gating is done
-    per-source with a named group or capability -- see `linux.capabilities()`
-    and `linux.journal_access()`. This coarse check only covers the few things
-    that genuinely need root: DMI serials, btmp, SMART.
+    Windows privilege is binary where Linux is granular, so this one bit
+    gates several sources at once: the Security event log (sign-in history,
+    lock/unlock, failed sign-ins), other users' process identities, the SMART
+    failure-prediction bit and the minidump folder. Each panel still names
+    what it needs -- see `windows.access_map()` -- rather than saying "run as
+    administrator" and nothing else.
     """
-    try:
-        return os.geteuid() == 0
-    except AttributeError:
-        return False
+    from . import windows
+
+    return windows.is_elevated()
 
 
 def human_bytes(value: float) -> str:
