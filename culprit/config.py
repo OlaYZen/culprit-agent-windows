@@ -93,6 +93,11 @@ class Config:
     # Sustained D-state (uninterruptible sleep): the process is being made to
     # wait inside the kernel regardless of what any usage counter says.
     weight_stuck: float = 2.0
+    # A window that has stopped pumping messages (Task Manager's "Not
+    # responding"): the most direct "you are being made to wait" signal
+    # Windows has, and it catches a process frozen at 0% CPU that no usage
+    # counter would ever flag. Ungated, like weight_stuck on Linux.
+    weight_hung: float = 2.0
 
     # --- events ---
     event_lookback_days: int = 30
@@ -213,7 +218,7 @@ EDITABLE = {
     "disk_busy_high", "disk_space_low_pct", "gpu_high", "sustain_ticks",
     "psi_cpu_high", "psi_memory_high", "psi_io_high",
     "weight_cpu", "weight_memory", "weight_disk", "weight_gpu",
-    "weight_faults", "weight_stuck",
+    "weight_faults", "weight_stuck", "weight_hung",
     "event_lookback_days", "event_max_per_source",
     "allow_process_actions", "allow_remote_update", "open_browser", "ui",
     "deploy_host", "agent_command",
@@ -309,7 +314,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "psi_cpu_high": (1, 100), "psi_memory_high": (0.5, 100),
     "psi_io_high": (1, 100),
     "weight_cpu": (0, 10), "weight_memory": (0, 10), "weight_disk": (0, 10),
-    "weight_gpu": (0, 10), "weight_faults": (0, 10), "weight_stuck": (0, 10),
+    "weight_gpu": (0, 10), "weight_faults": (0, 10), "weight_stuck": (0, 10), "weight_hung": (0, 10),
     "event_lookback_days": (1, 3650),
     "event_max_per_source": (10, 5000),
     "notify_smtp_port": (1, 65535),
