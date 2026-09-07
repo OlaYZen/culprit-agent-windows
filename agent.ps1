@@ -324,7 +324,7 @@ function Save-Config {
                 $acl.AddAccessRule($rule)
             }
             Set-Acl $ConfigDir $acl
-        } catch { Write-Warn2 "could not tighten the ACL on $ConfigDir: $_" }
+        } catch { Write-Warn2 "could not tighten the ACL on ${ConfigDir}: $_" }
     }
 }
 function Test-Host { $null = Invoke-Snippet -Code $CheckSnippet -Arguments @($ConfigFile) }
