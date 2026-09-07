@@ -16,7 +16,7 @@ body:
       options:
         - label: I searched existing issues and did not find a duplicate.
           required: true
-        - label: I am on the latest release / image.
+        - label: I am on the latest release.
           required: true
         - label: This is not a security vulnerability (those go privately through the Security tab of the main repo).
           required: true
@@ -25,11 +25,9 @@ body:
     attributes:
       label: How is the agent deployed?
       options:
-        - Native, agent.sh as a normal user
-        - Native, agent.sh as root (sudo)
-        - systemd user service
-        - systemd system service (root)
-        - Docker (docker run / compose)
+        - Scheduled task as SYSTEM (agent.ps1 from an Administrator PowerShell)
+        - Scheduled task as my user (agent.ps1 unelevated)
+        - Foreground (agent.ps1 -Run)
         - TrueNAS SCALE or another managed container platform
         - Other (describe below)
     validations:
@@ -73,5 +71,5 @@ body:
       description: |
         Re-run with debug logging and paste the output, secrets redacted.
         Native: add `CULPRIT_LOG_LEVEL=debug`. Docker: add
-        `-e CULPRIT_LOG_LEVEL=debug`, then `docker logs culprit-agent`.
+        run `.\agent.ps1 -Run -LogLevel debug` and copy the output.
       render: shell

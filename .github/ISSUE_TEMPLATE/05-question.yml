@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         Happy to help. Please check the README first; most deployment questions
-        (native, systemd, Docker, the flags and mounts, NVIDIA GPU) are answered
+        (agent.ps1, the scheduled task, elevation) are answered
         there.
   - type: checkboxes
     id: preflight
@@ -35,5 +35,5 @@ body:
     id: context
     attributes:
       label: Context
-      description: OS, and how the agent is deployed (native, systemd, or Docker).
+      description: OS, and how the agent is deployed (the scheduled task or -Run).
       placeholder: e.g. Debian 12, Docker via compose

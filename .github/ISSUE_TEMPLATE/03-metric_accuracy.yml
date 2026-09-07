@@ -28,7 +28,7 @@ body:
         - Disk
         - Network / Ports
         - Processes / Lag Doctor
-        - Services (systemd units)
+        - Services (Service Control Manager)
         - Events
         - Sessions
         - Sync

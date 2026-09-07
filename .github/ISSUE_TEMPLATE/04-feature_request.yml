@@ -35,7 +35,7 @@ body:
     attributes:
       label: Area
       options:
-        - Deployment (agent.sh, systemd unit)
+        - Deployment (agent.ps1, the scheduled task)
         - Docker image / entrypoint
         - Configuration / environment variables
         - A collector or metric (may belong in the main repo)

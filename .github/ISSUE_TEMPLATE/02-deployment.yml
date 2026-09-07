@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         For getting the agent to connect, stay online, or read a source on a
-        watched machine (native, systemd, or Docker).
+        watched machine (the scheduled task or -Run).
   - type: checkboxes
     id: preflight
     attributes:
@@ -22,11 +22,9 @@ body:
     attributes:
       label: How is the agent deployed?
       options:
-        - Native, agent.sh as a normal user
-        - Native, agent.sh as root (sudo)
-        - systemd user service
-        - systemd system service (root)
-        - Docker (docker run / compose)
+        - Scheduled task as SYSTEM (agent.ps1 from an Administrator PowerShell)
+        - Scheduled task as my user (agent.ps1 unelevated)
+        - Foreground (agent.ps1 -Run)
         - TrueNAS SCALE or another managed container platform
         - Other (describe below)
     validations:
@@ -62,7 +60,7 @@ body:
     id: run-command
     attributes:
       label: How you started it
-      description: The `agent.sh` line, the `docker run` command, or the systemd unit. Redact the token.
+      description: The `agent.ps1` line or the scheduled task's action. Redact the token.
       render: shell
   - type: textarea
     id: agent-logs
@@ -70,16 +68,6 @@ body:
       label: Agent logs (debug)
       description: With `CULPRIT_LOG_LEVEL=debug`, secrets redacted.
       render: shell
-  - type: checkboxes
-    id: docker-flags
-    attributes:
-      label: If this is Docker, which flags are set?
-      description: Attribution needs the container to see the host. Tick what your command includes.
-      options:
-        - label: "`--pid host`"
-        - label: "`--network host`"
-        - label: "`--privileged` (or `--cap-add SYS_PTRACE --security-opt apparmor=unconfined`)"
-        - label: The host allows these (not a locked-down managed platform)
   - type: input
     id: os
     attributes:

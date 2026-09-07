@@ -1,199 +1,141 @@
-# culprit-agent
+# culprit-agent-windows
 
-A **self-contained, deployable** monitoring agent for
-[culprit](https://github.com/OlaYZen/culprit). Clone (or copy) this repo onto
-any Linux server you want to watch; it carries its own copy of the runnable
-`culprit` package, so at runtime it needs nothing from the host repo. It samples
-the machine and pushes reports to the culprit host; it runs no dashboard and
-**opens no listening ports**.
+The **Windows** agent for [culprit](https://github.com/OlaYZen/culprit): a
+self-contained, report-only node. Clone this repo onto any Windows 10/11 or
+Windows Server machine you want to watch; it carries its own copy of the
+runnable `culprit` package, so at runtime it needs nothing from the host repo.
+It samples the machine and pushes reports to the culprit host; it runs no
+dashboard and **opens no listening ports**.
+
+The Linux agent lives in [culprit-agent](https://github.com/OlaYZen/culprit-agent).
+This one reports the same payload shapes to the same host, so a fleet can mix
+both, and the dashboard shows what a Windows box can and cannot say.
 
 ## Deploy
 
-```bash
-git clone https://github.com/OlaYZen/culprit-agent.git
-cd culprit-agent
-sudo ./agent.sh
+```powershell
+git clone https://github.com/OlaYZen/culprit-agent-windows.git
+cd culprit-agent-windows
+.\agent.ps1          # or double-click agent.cmd
 ```
 
-That is the whole install. `agent.sh` creates a venv (psutil only) in
-`~/.local/share/culprit-agent/venv`,
-then **asks** for the culprit host's URL and this node's token (get the token
-from the host dashboard: Nodes > "Generate token"; it looks like
+That is the whole install. `agent.ps1` creates a venv (psutil + pywin32)
+outside the checkout, **asks** for the culprit host's URL and this node's token
+(get the token from the host dashboard: Nodes > "Generate token"; it looks like
 `<name>.<secret>`), checks that the host is reachable and accepts the token,
-saves both to `~/.config/culprit-agent/agent.json` (mode 600) so nothing is
-typed again, and offers to
-set the agent up as a systemd service that starts on boot and restarts on
-failure. Under `sudo` that is a **system** service running as root, which is
-what reads other users' processes, descriptors and ports; without `sudo` it is
-a **user** service that sees your own processes fully and others partly. The
-agent pushes reports to the host over HTTP(S) and **opens no listening ports**.
+saves both to `agent.json` so nothing is typed again, and offers to set the
+agent up as a **scheduled task** that starts on boot and restarts on failure.
 
-**Nothing is written into the checkout.** The venv, the config and the flight
-recorder live in the running user's XDG directories (root's own under `sudo`:
-`/root/.config/culprit-agent`, `/root/.local/share/culprit-agent`), so a plain
-`git pull` keeps working for whoever cloned it. Earlier versions wrote
-`.venv`, `agent.json` and `data/` into the checkout and, under `sudo`, made
-the whole checkout root's; the next `./agent.sh` moves those files to their
-new homes and gives the checkout back. Avoid `sudo git pull`: git as root in
-a directory it does not own refuses with "dubious ownership", and if forced it
-leaves root-owned files behind that break the next plain `git pull`.
+From an **Administrator** PowerShell the task runs as SYSTEM at boot, which is
+what reads the Security event log (sign-ins, lock/unlock, failed sign-ins),
+other users' processes and the drive failure-prediction bit; the venv, config
+and flight recorder live under `%ProgramData%\culprit-agent`. Unelevated, the
+task runs as you at sign-in, the files live in your profile
+(`%LOCALAPPDATA%\culprit-agent`, `%APPDATA%\culprit-agent`), and it sees your
+own processes fully and other users' partly -- but it can see your windows, so
+**"not responding" detection works**, which the SYSTEM task cannot do
+(services have no desktop).
 
 Other ways to run it:
 
-```bash
-./agent.sh --run                                   # foreground, using the saved config
-./agent.sh --run http://192.168.1.1:8787 web-01.<secret>   # ...or with the values given
-./agent.sh --configure                             # change the host or token, then restart the service
-./agent.sh --install-only                          # venv only, no prompts (CI, images)
-./agent.sh --host https://hub:8787 --token web-01.<secret> --insecure   # self-signed TLS
+```powershell
+.\agent.ps1 -Run                                          # foreground, using the saved config
+.\agent.ps1 -Run -Host http://192.168.1.1:8787 -Token web-01.<secret>   # ...or with the values given
+.\agent.ps1 -Configure                                    # change the host or token, then restart the task
+.\agent.ps1 -InstallOnly                                  # venv only, no prompts (CI, images)
+.\agent.ps1 -Host https://hub:8787 -Token web-01.<secret> -Insecure     # self-signed TLS
 ```
 
-If you skip the prompt, nothing is saved and the agent needs the URL and
-token as arguments every time. The unit files in this folder are the manual
-alternative to the prompt (`culprit-agent.service` for a user unit,
-`culprit-agent.system.service` for root); `agent.sh` generates its own with
-the folder's real path.
+`agent.cmd` is the double-clickable equivalent for when PowerShell's execution
+policy is in the way; it bypasses the policy for that one run and changes no
+machine setting. Needs Python 3.10+ from python.org (the Microsoft Store build
+restricts venv).
 
-## Docker
+## What it reports
 
-A prebuilt image is published to GitHub Container Registry on every push
-(GitHub Actions builds `ghcr.io/olayzen/culprit-agent`). The agent monitors the
-**host** it runs on, so it runs **privileged** in the host's PID and network
-namespaces.
+The same sections as the Linux agent, from Windows sources:
 
-Set your host URL and token, then run this. It is the whole installer:
-
-```bash
-docker run -d --name culprit-agent --restart unless-stopped --pull always \
-  --privileged --pid host --network host \
-  -e CULPRIT_HOST=http://192.168.1.1:8787 \
-  -e CULPRIT_TOKEN=web-01.your-secret-here \
-  -v /etc/passwd:/etc/passwd:ro \
-  -v /etc/group:/etc/group:ro \
-  -v /etc/os-release:/etc/os-release:ro \
-  -v /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro \
-  -v /var/log/journal:/var/log/journal:ro \
-  -v /etc/machine-id:/etc/machine-id:ro \
-  -v /run/systemd:/run/systemd:ro \
-  -v /run/dbus:/run/dbus:ro \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  ghcr.io/olayzen/culprit-agent:latest
-```
-
-Only the two `CULPRIT_HOST` / `CULPRIT_TOKEN` values are required. Add any of
-the optional `-e` vars below if you need them:
-
-- `CULPRIT_HOST` **(required):** your host dashboard URL, e.g. `http://192.168.1.1:8787`
-- `CULPRIT_TOKEN` **(required):** get it from the dashboard (Nodes > *Generate token*), or `CULPRIT_TOKEN_FILE` to read it from a mounted file / Docker secret
-- `CULPRIT_INTERVAL=1`: fast-tier sampling seconds (default `1`)
-- `CULPRIT_INSECURE=1`: accept a self-signed host cert (only for an `https://` host with an untrusted cert; irrelevant for plain HTTP)
-- `CULPRIT_LOG_LEVEL=info`: set `debug` when troubleshooting
-
-To update later, re-run the exact same command: `--pull always` fetches the
-latest image and Docker recreates the container.
-
-### NVIDIA GPU
-
-To surface an NVIDIA GPU (utilisation, VRAM, per-process memory in the Graphics
-panel), add `--gpus all` and expose the driver's libraries. This needs the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-installed on the host:
-
-```bash
-docker run -d --name culprit-agent --restart unless-stopped --pull always \
-  --privileged --pid host --network host \
-  --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all \
-  -e CULPRIT_HOST=http://192.168.1.1:8787 \
-  -e CULPRIT_TOKEN=web-01.your-secret-here \
-  -v /etc/passwd:/etc/passwd:ro \
-  -v /etc/group:/etc/group:ro \
-  -v /etc/os-release:/etc/os-release:ro \
-  -v /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro \
-  -v /var/log/journal:/var/log/journal:ro \
-  -v /etc/machine-id:/etc/machine-id:ro \
-  -v /run/systemd:/run/systemd:ro \
-  -v /run/dbus:/run/dbus:ro \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  ghcr.io/olayzen/culprit-agent:latest
-```
-
-The image already bundles `nvidia-ml-py`, so `--gpus all` is the only extra you
-need. Without it the Graphics panel reads "unavailable" and nothing else is
-affected. **Intel / AMD GPUs don't use `--gpus`**; they surface through
-`/dev/dri`, which `--privileged` already exposes (Intel shows only while a
-process is actively using the GPU, e.g. a live transcode).
-
-**Why the flags and mounts:**
-
-| Flag / mount | Unlocks |
+| | Source |
 |---|---|
-| `--privileged` | full host access: all capabilities (`SYS_PTRACE` and the rest) and no AppArmor/seccomp confinement, so listening **ports** attribute to their process and are killable. Without it the Ports view shows every port as "another user's process" |
-| `--pid host` | sees the host's processes (and their per-process CPU/IO/FDs). **Mandatory:** even privileged, the agent sees nothing without it |
-| `--network host` | reaches the host node, and sees the host's interfaces and sockets |
-| `-v /etc/passwd + /etc/group` | resolves host UIDs to real login names (else system users read as `uid 101`) |
-| `-v /var/log/journal + /etc/machine-id` | the **journal** (Events view): `journalctl` reads it from files, no daemon needed. Persistent journal assumed; on a volatile-only host mount `/run/log/journal` instead |
-| `-v /run/systemd + /run/dbus` | the **Services (systemd units)** view, the unit **descriptions** on Ports, and login **Sessions**: `systemctl`/`loginctl` reach the host's systemd + D-Bus over these sockets |
-| `-v /etc/os-release` | the host's OS identity (else the image's Debian base); also gates Ubuntu Pro |
-| `-v /var/lib/ubuntu-advantage` | the Ubuntu Pro status row |
+| **Processor** | `% Processor Utility` (frequency-aware, what Task Manager shows), per core, the run-queue depth, clock and turbo ratio, interrupt + DPC time, the active power plan |
+| **Memory** | In use, available, **commit charge against its limit** (enforced on Windows, so it is a real ceiling), hard-fault rate, paged/non-paged pool, page files |
+| **GPU** | Per-adapter and **per-process** utilisation and VRAM by engine (3D, copy, video decode/encode) from the `GPU Engine` counters -- every WDDM adapter, integrated Intel/AMD included, no vendor library |
+| **Disk** | Per-physical-drive throughput, **queue depth and per-transfer latency**, volume capacity with a fill forecast, drive model/bus/firmware and the SMART failure-prediction bit |
+| **Network** | Per-adapter throughput, errors and drops, adapter config (IP/DNS/gateway/DHCP), the socket table mapped to its processes, VPN and WAN-exit detection, reachability probes |
+| **Processes** | Every process with CPU, memory, private bytes, disk I/O, GPU, threads, handles, page-fault rate, uptime -- from one `Process V2` counter collect (~100 ms for 450 processes) -- plus **"not responding"** windows |
+| **Services** | All of them from the Service Control Manager, the auto-start ones that are not running called out, scheduled tasks as the timer list |
+| **Events** | Bluescreens with decoded stop codes, app crashes with the faulting module and exception meaning, hangs, disk errors, service failures, WHEA hardware errors, low-memory diagnoses, Windows Update failures, Group Policy, time-sync and domain-connectivity problems, minidumps, pending reboot |
+| **Sessions** | Who is signed in now (console/RDP, locked or not), sign-in/sign-out history, lock/unlock and failed sign-ins (elevated), boots and clean shutdowns |
+| **Sync** | OneDrive: queue, failures, conflicts, stall flags, Known Folder Move health, per account |
+| **Ports** | What is listening on each port and the process behind it, with the host's End task |
+| **Outage Doctor** | Automatic services that are stopped (walked to the dependency that stopped first), services the SCM keeps restarting, a service running but no longer listening, expiring TLS certificates, the clock unsynchronised, DNS failing, a volume gone read-only, storage errors, a pending reboot -- each with a fix and the Restart / Start verb |
+| **Coroner** | After a crash or power loss: the shutdown record (who asked, and why), the bugcheck's stop code, WHEA and disk errors, the low-memory event, Windows Update installs just before |
 
-With all of the above, everything works: CPU, memory, PSI, disk, network,
-**ports** (with the systemd unit behind each), processes, journal events,
-sessions, systemd units, OS identity and Ubuntu Pro.
+The **Lag Doctor** runs the same two-stage model as on Linux, in its derived
+mode (Windows has no PSI): a 0..1 pressure per resource from the run queue,
+hard faults and disk latency, then each process scored by its share of a
+pressured resource. A not-responding window is scored ungated and raised as its
+own finding, because it is the one signal that means "you are being made to
+wait" regardless of any counter.
 
-Two honest caveats. The **Ports** view names each listener's systemd unit from
-the process's own cgroup, so the unit **name** shows even without the
-`/run/systemd` mount (the mount adds the friendlier **description**). And
-systemd-over-a-socket from inside a container can be **intermittent**: a
-Services tick may occasionally read "unavailable", and the **Services** view
-then falls back to listing the running units read from each process's cgroup
-(no per-unit CPU/memory, no inactive units) rather than showing nothing.
-Some managed platforms (e.g. TrueNAS SCALE apps) don't let you run privileged
-or set `--pid host` / these mounts; there the agent runs with whatever it is
-given and degrades the rest (an unattributable port still shows its **owner**
-from `/proc/net`, just not a kill button). For the fullest picture, run it with
-the command above, or natively (`agent.sh`) as root.
+## What Windows cannot say
 
-To build the image yourself: `docker build -t culprit-agent .`
+Every one of these is reported as **"Not capable in Windows"** with the reason,
+never as a blank panel or a zero:
 
-## What's inside
+- **PSI** (pressure stall information): a Linux kernel interface. Pressure is
+  derived from counters and the dashboard says so.
+- **Per-service resource attribution** (cgroups): no per-service CPU, memory or
+  stall accounting. The process table names what each `svchost` hosts.
+- **Load average, D-state, run delay, kernel threads, wchan**: no Windows
+  equivalents. The run-queue depth and the hung-window count play their part.
+- **Software RAID and per-core IRQ rates** (`kernel` section).
+- **Containers**: Windows containers are not identified in this port.
+- **Deleted-but-open files** and the truncate verb: Windows refuses to delete
+  an open file, so the situation cannot arise.
+- **Per-file write rates and per-volume writers**: naming a process's open files
+  costs ~250 ms per process on Windows.
+- **inotify watch exhaustion** and **conntrack** limits.
+- **Per-connection RTT / retransmits** (`tcp_info`): needs ESTATS and elevation.
+- **Accept-queue overflow** ("turned-away clients"): not exposed per listener.
+- **The OOM killer's ranking**: Windows has no OOM killer; the memory forecast
+  is the equivalent answer.
+- **`reset-failed`** for services: the SCM keeps no failed state to reset.
 
-```
-agent.sh                      install (venv), ask + save host/token, set up the service or run
-requirements-agent.txt        psutil, the only runtime dependency
-culprit-agent.service         systemd USER unit (unprivileged) -- manual alternative to agent.sh
-culprit-agent.system.service  systemd SYSTEM unit, runs as root -- manual alternative to sudo ./agent.sh
-Dockerfile                    builds the ghcr.io/olayzen/culprit-agent image
-docker/entrypoint.sh          maps the CULPRIT_* env vars onto the agent CLI
-sync-package.sh               maintainer tool: refresh culprit/ from the repo
-culprit/                      a copy of the runnable package (collectors, sampler,
-                              db, state, config, linux, util, agent)
+## Actions the host can relay
 
-Outside the checkout, per running user (root's own under sudo):
+End task, priority (Windows priority classes: idle, below normal, normal,
+above normal, high -- never realtime), **Throttle** (a Job Object CPU rate
+cap: half or a quarter of the machine, reversible), Restart / Start for the
+Outage Doctor's items, and the **remote update** (a `git reset` to the branch
+the host names, then the task restarts it -- capable only when started by the
+scheduled task, so something brings it back up). All are gated by the agent's
+own `allow_process_actions`, and the guards refuse PID 0/4, csrss, lsass,
+services.exe, the agent itself, and the services Windows cannot run without.
 
-~/.config/culprit-agent/agent.json          host URL + token, mode 600
-~/.local/share/culprit-agent/venv           the agent's virtual environment
-~/.local/share/culprit-agent/flight-recorder.json.gz
-                              the flight recorder: the last ten minutes, rewritten every
-                              five seconds; read at the next start to report a death
-                              (a crash, a hang, a power cut, a kill) to the host's Coroner
-```
+## Verifying a change
 
-## Keeping the package copy in sync (maintainers only)
-
-`culprit/` here is a **duplicate** of the host repo's top-level `culprit/`
-package, minus the host-only modules (`main.py`, `auth.py`, `nodes.py`,
-`__main__.py`) and plus the agent-only `agent.py`. This is the cost of a
-one-folder, self-contained bundle: after changing any shared code (a collector,
-the sampler, `db`/`state`/`config`/`linux`/`util`) in the host repo, refresh the
-copy here. `sync-package.sh` pulls from a sibling `culprit/` checkout (i.e. the
-[culprit](https://github.com/OlaYZen/culprit) repo cloned next to this one):
+There is no Windows machine in the dev loop, so the shape checker stands in:
 
 ```bash
-./sync-package.sh          # reads ../culprit, preserves agent.py, skips host-only files
+python tools/check_shapes.py            # both modes
+python tools/check_shapes.py --mode fake --dump
 ```
 
-## Security
+It runs every collector twice -- **bare** (no pywin32: every source must
+degrade to `available: False` with a reason) and **fake** (with
+`tools/fakewin.py`'s stand-ins for PDH, the event log, WMI, the registry,
+WTS and the SCM, so the parsing and aggregation paths run on canned data) --
+and checks every dotted path in the host's frontend contract
+(`../culprit/tools/check_contract.py`, read live) against what came out.
+What it cannot prove is that the real Windows APIs behave as the fakes do;
+that was measured on a real machine in the original Windows build this port
+descends from, and needs a real machine again after any change to the PDH or
+event-log code.
 
-Found a vulnerability? Please report it privately, never in a public issue. See
-the security policy in the main repository:
-<https://github.com/OlaYZen/culprit/security/policy>.
+## Versioning and updates
+
+`version.json` is the version; the host compares it against what this
+repository's `main` (or the configured branch) publishes, and the remote
+update is a `git reset --hard` plus `pip install`, so the checkout must be a
+real clone with an `origin` remote and a clean tree.
