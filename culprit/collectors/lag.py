@@ -596,10 +596,9 @@ class LagAnalyzer:
                     "key": f"space_{mount}",
                     "severity": "critical" if free_pct <= 3 else "warn",
                     "title": f"{mount} nearly full",
-                    "detail": f"{free_pct:.1f}% free for users (ext4 reserves "
-                              "~5% for root on top of this). Full filesystems "
-                              "fail writes, break package upgrades, and "
-                              "journald starts dropping history." + held_text,
+                    "detail": f"{free_pct:.1f}% free. A full volume fails "
+                              "writes, breaks updates and the page file's "
+                              "growth, and stops logs being written." + held_text,
                     "resource": "storage",
                     "evidence": {"mountpoint": mount,
                                  "free": volume.get("free"),
