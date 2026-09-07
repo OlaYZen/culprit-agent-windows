@@ -155,7 +155,15 @@ function Invoke-Snippet {
     Set-Content -Path $file -Value $Code -Encoding utf8
     try {
         $env:PYTHONPATH = $Root
-        & $VenvPython $file @Arguments
+        # Windows PowerShell 5.1 turns a native command's stderr into an
+        # ErrorRecord under 2>&1, and with ErrorActionPreference Stop that
+        # would abort the installer on the very traceback it is trying to
+        # show; Continue while the snippet runs.
+        $ErrorActionPreference = 'Continue'
+        # stderr merged in, so a traceback from the snippet is shown rather
+        # than swallowed -- the first Windows run failed the import check
+        # with nothing to read.
+        & $VenvPython $file @Arguments 2>&1 | ForEach-Object { Write-Host "  $_" }
         return $LASTEXITCODE
     } finally {
         Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
