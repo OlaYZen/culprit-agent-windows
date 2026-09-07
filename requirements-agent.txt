@@ -1,3 +1,12 @@
 # Agent (report-only node) dependencies. Everything else the agent uses is
 # the standard library -- no FastAPI, no uvicorn, no web stack at all.
+#
+# Both publish wheels for supported CPython versions, so agent.ps1 never
+# needs a C compiler. pywin32 supplies win32pdh (performance counters -> the
+# process table, per-PID GPU usage, disk latency, hard faults), win32evtlog
+# (the event log without shelling out to PowerShell), win32gui
+# (hung-window detection), win32com (WMI), win32service/win32serviceutil
+# (service state and the Outage Doctor's verbs), win32ts (who is signed in)
+# and win32job (the CPU throttle).
 psutil>=6.0
+pywin32>=306; sys_platform == "win32"

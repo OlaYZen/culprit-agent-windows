@@ -1,12 +1,9 @@
-# Virtual environment — recreated by agent.sh on the target
+# Virtual environment — agent.ps1 creates it outside the checkout, but never commit one
 .venv/
+venv/
 
-# Agent credentials — host URL + bearer token, written by agent.sh. Never commit.
+# Agent credentials — host URL + bearer token, written by agent.ps1 outside the checkout. Never commit.
 agent.json
-
-# Docker env files hold the token — commit only .env.example.
-.env
-stack.env
 
 # The agent keeps no database, but never commit one if it appears
 *.db
