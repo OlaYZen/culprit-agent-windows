@@ -348,9 +348,46 @@ _EVENTS = {
     ("Security", 4625): (("Microsoft-Windows-Security-Auditing", 0, 900,
                           _named(TargetUserName="admin", TargetDomainName="CORP", Status="0xc000006d",
                                  SubStatus="0xc000006a", IpAddress="10.0.0.9")),),
+    # Task Scheduler Operational: 100 opens an instance, 102 closes the same
+    # one, which is what gives a scheduled task a measured duration.
+    ("Microsoft-Windows-TaskScheduler/Operational", 100): (
+        ("Microsoft-Windows-TaskScheduler", 4, 3600,
+         _named(TaskName="\\Backup\\Nightly", InstanceId="{inst-1}", UserContext="SYSTEM")),
+        ("Microsoft-Windows-TaskScheduler", 4, 90000,
+         _named(TaskName="\\Maintenance\\Reindex", InstanceId="{inst-2}", UserContext="SYSTEM")),),
+    ("Microsoft-Windows-TaskScheduler/Operational", 102): (
+        ("Microsoft-Windows-TaskScheduler", 4, 3000,
+         _named(TaskName="\\Backup\\Nightly", InstanceId="{inst-1}")),),
     ("Microsoft-Windows-User Profile Service/Operational", 2): (
         ("Microsoft-Windows-User Profile Service", 4, 7100, _named(Session=1)),),
 }
+
+
+# `schtasks /query /v /fo csv` as Windows prints it (trimmed to the columns
+# the collector reads), with times generated from NOW so they line up with the
+# Task Scheduler events above: Nightly's last run IS the instance the log
+# paired, and Reindex's is newer than the stale 100 the log still holds.
+def _task_stamp(ago):
+    return time.strftime("%m/%d/%Y %I:%M:%S %p", time.localtime(NOW - ago))
+
+
+SCHTASKS_CSV = (
+    '"HostName","TaskName","Next Run Time","Status","Last Run Time","Last Result",'
+    '"Task To Run","Run As User"\r\n'
+    f'"WIN-DEV","\\Backup\\Nightly","{_task_stamp(-82800)}","Ready",'
+    f'"{_task_stamp(3600)}","0","C:\\backup\\run.cmd","SYSTEM"\r\n'
+    f'"WIN-DEV","\\Maintenance\\Reindex","{_task_stamp(-79200)}","Ready",'
+    f'"{_task_stamp(1800)}","2147942402","C:\\tools\\reindex.exe","SYSTEM"\r\n'
+)
+
+
+def fake_run(real):
+    """windows.run with schtasks answered from the canned CSV."""
+    def run(argv, timeout=10.0):
+        if argv and str(argv[0]) == "schtasks":
+            return SCHTASKS_CSV
+        return real(argv, timeout)
+    return run
 
 
 def _make_win32evtlog(elevated=True):

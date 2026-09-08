@@ -242,6 +242,11 @@ def main() -> int:
         sys.path.insert(0, str(ROOT / "tools"))
         import fakewin
         fakewin.install(elevated=not args.unelevated)
+        # schtasks is a console tool, not a pywin32 module, so it is faked
+        # here rather than by install(): the scheduled-task rows (and the
+        # run each one carries) are only exercised with it in place.
+        from culprit import windows as windows_mod
+        windows_mod.run = fakewin.fake_run(windows_mod.run)
         os.environ["CULPRIT_AGENT_TASK"] = "culprit-agent"
     print(f"\n{args.mode} mode: running every collector" + (" on canned Windows data" if args.mode == "fake" else " with no pywin32 (degraded)"))
     print("-" * 70)
@@ -294,6 +299,19 @@ def main() -> int:
              any(s["name"] == "Spooler" for s in snapshot["services"]["services"])),
             ("Spooler is a problem", any(p["name"] == "Spooler" for p in snapshot["services"]["problems"])),
             ("outage names Spooler", any(i["key"].endswith(":Spooler") for i in snapshot["outage"]["items"])),
+            # Scheduled tasks in the timer shape, each with the run the Task
+            # Scheduler's own log timed (100 opened it, 102 closed it).
+            ("scheduled tasks are listed", len(snapshot["services"]["timers"]) == 2),
+            ("a task carries its measured run",
+             any((t.get("run") or {}).get("duration_s") == 600.0
+                 and t["run"]["result"] == "success"
+                 for t in snapshot["services"]["timers"])),
+            ("a task whose completion the log lost reports no run, and says why",
+             any(t.get("run") is None and "no completed run" in (t.get("run_reason") or "")
+                 for t in snapshot["services"]["timers"])),
+            ("... and its failure still shows through the scheduler's result",
+             any(t.get("run") is None and t.get("last_result") not in (None, 0)
+                 for t in snapshot["services"]["timers"])),
             ("outage offers a restart", any(a["verb"] == "restart" for i in snapshot["outage"]["items"]
                                             for a in i.get("actions") or [])),
             ("bugcheck decoded", any(e.get("bugcheck", {}).get("name") == "DRIVER_IRQL_NOT_LESS_OR_EQUAL"

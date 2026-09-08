@@ -38,6 +38,7 @@ from datetime import datetime
 import psutil
 
 from .. import windows
+from . import events as events_mod
 
 log = logging.getLogger("culprit.services")
 
@@ -72,6 +73,10 @@ _BENIGN_STOPPED = {
 }
 
 _TASKS_REFRESH_S = 300.0
+# How far back the Operational log is read for task runs, and how many events
+# that is allowed to cost. One read every _TASKS_REFRESH_S, not per tick.
+_TASK_RUN_LOOKBACK_DAYS = 14
+_TASK_RUN_EVENTS = 400
 # Task Scheduler result codes that mean "did not fail".
 _TASK_OK = {0, 0x41301, 0x41302, 0x41303, 0x41304, 0x41306, 0x41325, 0x41326, 0x420, 0x800710E0}
 
@@ -272,7 +277,99 @@ def _scheduled_tasks() -> tuple[list[dict[str, object]], str | None]:
             "run_as": row.get("Run As User"),
         })
     out.sort(key=lambda t: (not t["failed"], str(t["unit"]).lower()))
-    return out[:120], None
+    out = out[:120]
+    runs, run_reason = _task_runs({str(t["unit"]) for t in out})
+    for task in out:
+        run = runs.get(str(task["unit"]))
+        reason = run_reason
+        last = task.get("last")
+        if run is not None and isinstance(last, (int, float)) \
+                and float(last) > float(run["started"]) + 60:
+            # The instance the log paired is older than the run the scheduler
+            # says was the last one: the completion event is missing (the log
+            # rolled, or the machine went down mid-task). Not the last run,
+            # so not reported as one.
+            run, reason = None, ("the Task Scheduler log holds no completed run for "
+                                 "the last time this task ran")
+        if run is not None and not run["running"] and task.get("last_result") is not None:
+            # The scheduler's own result code is the reliable one, and it
+            # describes the run that *finished*; the Operational log supplies
+            # the timing the code has no room for. A run still in flight gets
+            # neither -- its result does not exist yet.
+            run["status"] = task["last_result"]
+            run["result"] = ("success" if task["last_result"] in _TASK_OK
+                             else f"result {task['last_result']}")
+        task["run"] = run
+        task["run_reason"] = None if run is not None else reason
+    return out, None
+
+
+def _task_runs(names: set[str]) -> tuple[dict[str, dict[str, object]], str | None]:
+    """The last run of each task, timed from the Task Scheduler's own log.
+
+    `schtasks` says when a task last ran and how it ended. It does not say how
+    **long** it took, and that is the number that catches a backup which
+    "succeeded" in four seconds. The Operational channel does: event 100 opens
+    an instance and 102 closes the same one, so a start paired with its end is
+    a duration measured by Windows itself rather than inferred.
+
+    That channel is not readable by a standard user, so this degrades the way
+    every gated source here does: `run: null` with the exact unlock named,
+    never a guessed duration.
+    """
+    if not names:
+        return {}, None
+    spec = events_mod.EventSpec(
+        key="task_run", label="Scheduled task run",
+        channel="Microsoft-Windows-TaskScheduler/Operational",
+        ids=(100, 102), kind="task", severity="info",
+        providers=("Microsoft-Windows-TaskScheduler",),
+        requires_admin=True, limit=_TASK_RUN_EVENTS,
+    )
+    try:
+        entries = events_mod.query_channel(spec, _TASK_RUN_LOOKBACK_DAYS, _TASK_RUN_EVENTS)
+    except PermissionError:
+        return {}, ("Not capable in Windows: the Task Scheduler Operational log needs "
+                    "an Administrator task, so how long each task ran is unknown "
+                    "(its result is not)")
+    except Exception as exc:  # noqa: BLE001 -- one optional source, never the tier
+        log.debug("task run log unreadable: %s", exc)
+        return {}, f"the Task Scheduler Operational log could not be read ({_brief(exc)})"
+    if not entries:
+        return {}, ("the Task Scheduler Operational log is empty or disabled "
+                    "(wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true)")
+
+    # Newest first. An instance is one run: 102 closes what 100 opened.
+    ends: dict[str, float] = {}
+    out: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        data = entry.get("data") or {}
+        name = str(data.get("TaskName") or "")
+        instance = str(data.get("InstanceId") or "")
+        stamp = entry.get("timestamp")
+        if name not in names or not isinstance(stamp, (int, float)):
+            continue
+        key = instance or name
+        if entry.get("id") == 102:
+            ends.setdefault(key, float(stamp))
+            continue
+        if entry.get("id") != 100 or name in out:
+            continue                       # 100 without a 102 yet: still running
+        ended = ends.pop(key, None)
+        out[name] = {
+            "started": float(stamp),
+            "ended": ended,
+            "duration_s": round(ended - float(stamp), 3) if ended and ended >= stamp else None,
+            "elapsed_s": round(time.time() - float(stamp), 1) if ended is None else None,
+            "status": None,
+            "result": None,
+            "running": ended is None,
+        }
+    return out, None
+
+
+def _brief(exc: Exception, limit: int = 120) -> str:
+    return str(exc)[:limit] or exc.__class__.__name__
 
 
 def _task_time(value: str | None) -> float | None:
